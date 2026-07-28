@@ -2395,7 +2395,6 @@ def insar_rme_blocksvd(
     az_edges = torch.linspace(0, ntheta, n_az_blocks + 1).to(torch.long).tolist()
 
     nblocks = n_r_blocks * n_az_blocks
-    block_power = torch.zeros(nblocks, device=device)
     pos_s_y = pos_s[:, 1]
 
     # Optional spatial coherence weighting (downweight decorrelated regions
@@ -2409,42 +2408,67 @@ def insar_rme_blocksvd(
     # [lo, hi) and the exact boolean mask is re-applied to alpha after,
     # so non-monotonic tracks stay correct. Degenerate or fully masked
     # blocks keep lo == hi == 0 and produce zero alpha rows.
-    blocks = torch.zeros((nblocks, 6), dtype=torch.int32)
+    #
+    # Everything here is built with whole-tensor ops: a per-block Python
+    # loop needs a device sync per block to read the aperture window
+    # bounds, which costs far more than the alpha kernel itself.
+    ri0 = torch.tensor(r_edges[:-1], dtype=torch.int32, device=device)
+    ri1 = torch.tensor(r_edges[1:], dtype=torch.int32, device=device)
+    ti0 = torch.tensor(az_edges[:-1], dtype=torch.int32, device=device)
+    ti1 = torch.tensor(az_edges[1:], dtype=torch.int32, device=device)
+    # [n_r_blocks, n_az_blocks], flattened to block index ib*n_az_blocks+jb
+    valid = ((ri1 > ri0)[:, None] & (ti1 > ti0)[None, :]).reshape(nblocks)
+
+    # Per-block image power via a summed-area table (float64 to keep the
+    # differences of large partial sums accurate).
+    sat = torch.zeros((nr + 1, ntheta + 1), dtype=torch.float64, device=device)
+    sat[1:, 1:] = (
+        (img_m_eff.abs() ** 2).to(torch.float64).cumsum(0).cumsum(1)
+    )
+    r_hi = ri1.long()[:, None]
+    r_lo = ri0.long()[:, None]
+    t_hi = ti1.long()[None, :]
+    t_lo = ti0.long()[None, :]
+    block_power = (
+        sat[r_hi, t_hi] - sat[r_lo, t_hi] - sat[r_hi, t_lo] + sat[r_lo, t_lo]
+    ).reshape(nblocks).to(torch.float32).clamp(min=0.0) * valid
+
     if aperture_mask:
-        mask = torch.zeros(
-            (nblocks, nsweeps_s), dtype=torch.bool, device=device
-        )
-    for ib in range(n_r_blocks):
-        ri0, ri1 = r_edges[ib], r_edges[ib + 1]
-        for jb in range(n_az_blocks):
-            ti0, ti1 = az_edges[jb], az_edges[jb + 1]
-            if ri1 <= ri0 or ti1 <= ti0:
-                continue
-            bidx = ib * n_az_blocks + jb
-            block_power[bidx] = torch.sum(
-                torch.abs(img_m_eff[ri0:ri1, ti0:ti1]) ** 2
-            )
-            if aperture_mask:
-                rc_mid = float(r0 + dr * 0.5 * (ri0 + ri1))
-                tc_mid = float(theta0 + dtheta * 0.5 * (ti0 + ti1))
-                rel_theta = (rc_mid * tc_mid - pos_s_y) / rc_mid
-                lo = aperture_pad * theta0
-                hi = aperture_pad * theta1
-                mask_b = (rel_theta >= lo) & (rel_theta <= hi)
-                sweep_idx = mask_b.nonzero(as_tuple=True)[0]
-                if sweep_idx.numel() == 0:
-                    continue
-                mask[bidx] = mask_b
-                s_lo = int(sweep_idx[0])
-                s_hi = int(sweep_idx[-1]) + 1
-            else:
-                s_lo, s_hi = 0, nsweeps_s
-            blocks[bidx] = torch.tensor(
-                [ri0, ri1, ti0, ti1, s_lo, s_hi], dtype=torch.int32
-            )
+        rc_mid = (r0 + dr * 0.5 * (ri0 + ri1).to(torch.float32))[:, None, None]
+        tc_mid = (
+            theta0 + dtheta * 0.5 * (ti0 + ti1).to(torch.float32)
+        )[None, :, None]
+        rel_theta = (rc_mid * tc_mid - pos_s_y[None, None, :]) / rc_mid
+        mask = (
+            (rel_theta >= aperture_pad * theta0)
+            & (rel_theta <= aperture_pad * theta1)
+        ).reshape(nblocks, nsweeps_s) & valid[:, None]
+        # Hull [first, last+1) of each block's masked sweeps.
+        m_int = mask.to(torch.uint8)
+        any_sweep = mask.any(dim=1)
+        s_lo = torch.argmax(m_int, dim=1).to(torch.int32)
+        s_hi = (
+            nsweeps_s - torch.argmax(m_int.flip(1), dim=1)
+        ).to(torch.int32)
+        s_lo = torch.where(any_sweep, s_lo, torch.zeros_like(s_lo))
+        s_hi = torch.where(any_sweep, s_hi, torch.zeros_like(s_hi))
+    else:
+        s_lo = torch.zeros(nblocks, dtype=torch.int32, device=device)
+        s_hi = torch.full(
+            (nblocks,), nsweeps_s, dtype=torch.int32, device=device
+        ) * valid
+
+    blocks = torch.stack([
+        ri0[:, None].expand(-1, n_az_blocks).reshape(nblocks),
+        ri1[:, None].expand(-1, n_az_blocks).reshape(nblocks),
+        ti0[None, :].expand(n_r_blocks, -1).reshape(nblocks),
+        ti1[None, :].expand(n_r_blocks, -1).reshape(nblocks),
+        s_lo,
+        s_hi,
+    ], dim=1) * valid[:, None]
 
     A_raw = blocksvd_alpha(
-        img_m_eff.to(torch.complex64), data_s, pos_s, blocks.to(device),
+        img_m_eff.to(torch.complex64), data_s, pos_s, blocks,
         fc, r_res, r0, dr, theta0, dtheta, d0=d0, data_fmod=data_fmod,
     )
     if aperture_mask:

@@ -529,6 +529,137 @@ __global__ void gpga_backprojection_2d_kernel(
     }
 }
 
+// Geometry and data parameters shared by every pixel of a blocksvd_alpha
+// launch, packed to keep the device helper signatures short.
+struct BlocksvdParams {
+    int sweep_samples;
+    int Ntheta;
+    float ref_phase;
+    float delta_r;
+    float r0;
+    float dr;
+    float theta0;
+    float dtheta;
+    float d0;
+    float data_fmod;
+};
+
+// One pixel's contribution to alpha[b, m]: interpolate the sweep at the
+// pixel's range, demodulate, and accumulate against the conjugated
+// (shared-memory) master pixel.
+__device__ __forceinline__ void blocksvd_accumulate_pixel(
+          const float2* __restrict__ data_row,
+          float2 w,
+          float r,
+          float theta,
+          float ct,
+          float pos_x,
+          float pos_y,
+          float pz2,
+          const BlocksvdParams p,
+          float* acc_r,
+          float* acc_i) {
+    const float px = r * ct - pos_x;
+    const float py = r * theta - pos_y;
+
+    // Calculate distance to the pixel.
+    const float d = sqrtf(px * px + py * py + pz2);
+    const float sx = p.delta_r * (d + p.d0);
+
+    // Linear interpolation.
+    const int id0 = sx;
+    if (sx < 0.0f || id0 + 1 >= p.sweep_samples) {
+        return;
+    }
+    const float2 s0 = __ldg(&data_row[id0]);
+    const float2 s1 = __ldg(&data_row[id0 + 1]);
+    const float f = sx - id0;
+    const float sr = s0.x + f * (s1.x - s0.x);
+    const float si = s0.y + f * (s1.y - s0.y);
+
+    float ref_sin, ref_cos;
+    __sincosf(fmaf(p.ref_phase, d, -p.data_fmod * sx), &ref_sin, &ref_cos);
+    const float vr = sr * ref_cos - si * ref_sin;
+    const float vi = sr * ref_sin + si * ref_cos;
+
+    // conj(img_pixel) * value
+    *acc_r += w.x * vr + w.y * vi;
+    *acc_i += w.x * vi - w.y * vr;
+}
+
+// Sum of this warp's share of one image block's pixels for one sweep.
+// The image patch is staged into shared memory transposed to [j][i], so
+// the strided (Ntheta-apart) image column reads happen once per CTA
+// instead of once per (sweep, pixel), and the pixel loop reads it
+// conflict-free.
+//
+// FLAT picks the lane mapping. The default (FLAT=false) walks one theta
+// column at a time so consecutive lanes read consecutive range samples
+// of data_row, which is what keeps the sample loads coalesced. Blocks
+// with fewer range rows than a warp would leave most lanes idle that
+// way, so those use FLAT=true and spread lanes over the whole tile
+// instead. The choice is CTA-uniform, so the __syncthreads() below are
+// reached by every thread of the CTA.
+template <int TR, int TJ, bool FLAT>
+__device__ void blocksvd_warp_sum(
+          const complex64_t* __restrict__ img,
+          const float2* __restrict__ data_row,
+          float2 (*sh)[TR],
+          int ri0, int ri1, int ti0, int ti1,
+          float pos_x, float pos_y, float pz2,
+          bool active,
+          const BlocksvdParams p,
+          float* acc_r,
+          float* acc_i) {
+    const int lane = threadIdx.x & 31;
+    for (int tb = ti0; tb < ti1; tb += TJ) {
+        const int ncol = min(TJ, ti1 - tb);
+        for (int rb = ri0; rb < ri1; rb += TR) {
+            const int nrow = min(TR, ri1 - rb);
+
+            __syncthreads();
+            for (int t = threadIdx.x; t < nrow * ncol; t += blockDim.x) {
+                const int ii = t / ncol;
+                const int jj = t - ii * ncol;
+                sh[jj][ii] = *(const float2*)(
+                        img + (size_t)(rb + ii) * p.Ntheta + tb + jj);
+            }
+            __syncthreads();
+            if (!active) {
+                continue;
+            }
+
+            if (FLAT) {
+                for (int t = lane; t < nrow * ncol; t += 32) {
+                    const int jj = t / nrow;
+                    const int ii = t - jj * nrow;
+                    const float theta = p.theta0 + (tb + jj) * p.dtheta;
+                    const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
+                    blocksvd_accumulate_pixel(
+                            data_row, sh[jj][ii], p.r0 + (rb + ii) * p.dr,
+                            theta, ct, pos_x, pos_y, pz2, p, acc_r, acc_i);
+                }
+            } else {
+                for (int jj = 0; jj < ncol; jj++) {
+                    const float theta = p.theta0 + (tb + jj) * p.dtheta;
+                    const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
+                    for (int ii = lane; ii < nrow; ii += 32) {
+                        blocksvd_accumulate_pixel(
+                                data_row, sh[jj][ii], p.r0 + (rb + ii) * p.dr,
+                                theta, ct, pos_x, pos_y, pz2, p,
+                                acc_r, acc_i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Shared image tile: TR range rows x TJ theta columns, transposed.
+constexpr int kBlocksvdTileR = 32;
+constexpr int kBlocksvdTileTheta = 32;
+constexpr unsigned int kBlocksvdThreads = 256;
+
 // Inner product of one image block against one sweep's backprojection
 // footprint: alpha[b, m] = sum over the block's pixels of
 // conj(img[pix]) * data[m, interp] * exp(j (ref_phase d - data_fmod sx)).
@@ -536,31 +667,31 @@ __global__ void gpga_backprojection_2d_kernel(
 // linear range interpolation); the master image acts as the pixel
 // weighting so the [npix, nsweeps] footprint matrix is never
 // materialized. Mirrors blocksvd_alpha_kernel_cpu in cpu/backproj.cpp.
+//
+// Thread mapping: one warp per (block, sweep), lanes spread over the
+// block's pixels; alpha[b, m] is a warp-shuffle reduction. A thread per
+// (block, sweep) instead (the natural transcription of the CPU kernel)
+// makes every lane in a warp read a different sweep row of `data`, so
+// each sample load costs 32 memory transactions.
+//
+// gridDim.y indexes blocks, gridDim.x tiles the sweep axis relative to
+// each block's sweep_lo, so CTAs past a block's aperture window exit
+// before doing any work.
+template <int TR, int TJ>
 __global__ void blocksvd_alpha_kernel(
-          const complex64_t* img,
-          const complex64_t* data,
-          const float* pos,
-          const int32_t* blocks,
-          complex64_t* alpha,
-          int sweep_samples,
+          const complex64_t* __restrict__ img,
+          const float2* __restrict__ data,
+          const float* __restrict__ pos,
+          const int32_t* __restrict__ blocks,
+          complex64_t* __restrict__ alpha,
           int nsweeps,
-          int nblocks,
-          int Ntheta,
-          float ref_phase,
-          float delta_r,
-          float r0,
-          float dr,
-          float theta0,
-          float dtheta,
-          float d0,
-          float data_fmod) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int idsweep = idx % nsweeps;
-    const int idblock = idx / nsweeps;
+          const BlocksvdParams p) {
+    __shared__ float2 sh[TJ][TR];
 
-    if (idblock >= nblocks || idsweep >= nsweeps) {
-        return;
-    }
+    const int idblock = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps_per_cta = blockDim.x >> 5;
 
     const int ri0 = blocks[idblock * 6 + 0];
     const int ri1 = blocks[idblock * 6 + 1];
@@ -568,52 +699,46 @@ __global__ void blocksvd_alpha_kernel(
     const int ti1 = blocks[idblock * 6 + 3];
     const int sweep_lo = blocks[idblock * 6 + 4];
     const int sweep_hi = blocks[idblock * 6 + 5];
-    // Output is pre-zeroed.
-    if (idsweep < sweep_lo || idsweep >= sweep_hi) {
+
+    // Output is pre-zeroed; sweeps outside [sweep_lo, sweep_hi) stay zero.
+    const int cta_sweep0 = sweep_lo + blockIdx.x * warps_per_cta;
+    if (cta_sweep0 >= sweep_hi || ri1 <= ri0 || ti1 <= ti0) {
         return;
     }
+    const int idsweep = cta_sweep0 + warp;
+    // Inactive warps still take part in the shared-memory staging barriers.
+    const bool active = idsweep < sweep_hi;
 
-    const float pos_x = pos[idsweep * 3 + 0];
-    const float pos_y = pos[idsweep * 3 + 1];
-    const float pos_z = pos[idsweep * 3 + 2];
-    const float pz2 = pos_z * pos_z;
-    const complex64_t* data_row = data + (size_t)idsweep * sweep_samples;
-
-    // Theta in the outer loop, range rows inner, mirroring
-    // blocksvd_alpha_kernel_cpu.
-    complex64_t acc = {0.0f, 0.0f};
-    for (int j = ti0; j < ti1; j++) {
-        const float theta = theta0 + j * dtheta;
-        const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
-
-        for (int i = ri0; i < ri1; i++) {
-            const float r = r0 + i * dr;
-            const float px = r * ct - pos_x;
-            const float py = r * theta - pos_y;
-
-            // Calculate distance to the pixel.
-            const float d = sqrtf(px * px + py * py + pz2);
-
-            const float sx = delta_r * (d + d0);
-
-            // Linear interpolation.
-            const int id0 = sx;
-            const int id1 = id0 + 1;
-            if (sx < 0.0f || id1 >= sweep_samples) {
-                continue;
-            }
-            const complex64_t s0 = data_row[id0];
-            const complex64_t s1 = data_row[id1];
-            const float interp_idx = sx - id0;
-            const complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
-
-            float ref_sin, ref_cos;
-            sincospif(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-            const complex64_t ref = {ref_cos, ref_sin};
-            acc += cuda::std::conj(img[(size_t)i * Ntheta + j]) * (s * ref);
-        }
+    float pos_x = 0.0f;
+    float pos_y = 0.0f;
+    float pz2 = 0.0f;
+    const float2* data_row = data;
+    if (active) {
+        pos_x = pos[idsweep * 3 + 0];
+        pos_y = pos[idsweep * 3 + 1];
+        const float pos_z = pos[idsweep * 3 + 2];
+        pz2 = pos_z * pos_z;
+        data_row = data + (size_t)idsweep * p.sweep_samples;
     }
-    alpha[(size_t)idblock * nsweeps + idsweep] = acc;
+
+    float acc_r = 0.0f;
+    float acc_i = 0.0f;
+    if (ri1 - ri0 < 32) {
+        blocksvd_warp_sum<TR, TJ, true>(img, data_row, sh, ri0, ri1, ti0, ti1,
+                pos_x, pos_y, pz2, active, p, &acc_r, &acc_i);
+    } else {
+        blocksvd_warp_sum<TR, TJ, false>(img, data_row, sh, ri0, ri1, ti0, ti1,
+                pos_x, pos_y, pz2, active, p, &acc_r, &acc_i);
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_r += __shfl_down_sync(0xffffffff, acc_r, off);
+        acc_i += __shfl_down_sync(0xffffffff, acc_i, off);
+    }
+    if (active && lane == 0) {
+        alpha[(size_t)idblock * nsweeps + idsweep] = complex64_t(acc_r, acc_i);
+    }
 }
 
 template<typename T>
@@ -2746,32 +2871,31 @@ at::Tensor blocksvd_alpha_cuda(
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
-	dim3 thread_per_block = {256};
-	// Up-rounding division.
-    int threads = nblocks * nsweeps;
-	unsigned int block_x = (threads + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x};
+    // One warp per (block, sweep). gridDim.x tiles the sweep axis
+    // relative to each block's sweep_lo; sizing it from nsweeps (rather
+    // than syncing to read the largest aperture window) over-launches
+    // CTAs that exit immediately, which costs a few percent.
+	dim3 thread_per_block = {kBlocksvdThreads};
+    const unsigned int warps_per_cta = kBlocksvdThreads / 32;
+	dim3 block_count = {
+        (unsigned int)((nsweeps + warps_per_cta - 1) / warps_per_cta),
+        (unsigned int)nblocks};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    blocksvd_alpha_kernel
+    const BlocksvdParams params = {
+        (int)sweep_samples, (int)Ntheta, (float)(kPI * ref_phase), delta_r,
+        (float)r0, (float)dr, (float)theta0, (float)dtheta,
+        (float)d0, (float)data_fmod};
+
+    blocksvd_alpha_kernel<kBlocksvdTileR, kBlocksvdTileTheta>
           <<<block_count, thread_per_block, 0, stream>>>(
                   (const complex64_t*)img_ptr,
-                  (const complex64_t*)data_ptr,
+                  (const float2*)data_ptr,
                   pos_ptr,
                   blocks_ptr,
                   (complex64_t*)alpha_ptr,
-                  sweep_samples,
                   nsweeps,
-                  nblocks,
-                  Ntheta,
-                  ref_phase,
-                  delta_r,
-                  r0,
-                  dr,
-                  theta0,
-                  dtheta,
-                  d0,
-                  data_fmod/kPI);
+                  params);
 	return alpha;
 }
 
