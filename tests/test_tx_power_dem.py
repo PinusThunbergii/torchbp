@@ -65,6 +65,7 @@ def _grid_axes(grid, device):
 
 
 class TestTxPowerDemDirect(TestCase):
+    device = "cpu"
     grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
 
     def _tx_power(self, device="cpu", dem=None, normalization="sigma",
@@ -80,7 +81,7 @@ class TestTxPowerDemDirect(TestCase):
             azimuth_resolution=azimuth_resolution, dem=dem)[0]
 
     def test_zero_dem_matches_no_dem(self):
-        device = "cpu"
+        device = self.device
         dem = torch.zeros(self.grid["nr"], self.grid["ntheta"], device=device)
         for norm in NORMALIZATIONS:
             for az_res in [True, False]:
@@ -96,7 +97,7 @@ class TestTxPowerDemDirect(TestCase):
         lowered by h, for every normalization: zero slopes reduce the terrain
         factors to the flat formulas with h = pos_z - h_dem, and the nadir
         floor uses the DEM-adjusted reference height."""
-        device = "cpu"
+        device = self.device
         h = 6.0
         dem = torch.full((self.grid["nr"], self.grid["ntheta"]), h,
                          device=device)
@@ -112,7 +113,7 @@ class TestTxPowerDemDirect(TestCase):
         sigma/gamma power isolates the terrain factor; compare against the
         hand-computed projected-area and terrain-flattened-gamma factors
         from the exact single-sweep geometry."""
-        device = "cpu"
+        device = self.device
         a, b = 0.15, 3.0
         nr, ntheta = self.grid["nr"], self.grid["ntheta"]
         rr, tt = _grid_axes(self.grid, device)
@@ -165,7 +166,7 @@ class TestTxPowerDemDirect(TestCase):
         self.assertLess(float(err_g.max()), 5e-3)
 
     def test_coarse_dem(self):
-        device = "cpu"
+        device = self.device
         nr, ntheta = self.grid["nr"], self.grid["ntheta"]
         # Constant coarse DEM must match constant fine DEM exactly.
         h = 5.0
@@ -203,7 +204,7 @@ class TestTxPowerDemDirect(TestCase):
         self.assertLess(float(torch.quantile(err, 0.95)), 0.02)
 
     def test_slant_dem_raises(self):
-        device = "cpu"
+        device = self.device
         g, g_extent = _antenna(device)
         wa, pos, att = _straight_track(device, alt=0.0)
         dem = torch.zeros(self.grid["nr"], self.grid["ntheta"], device=device)
@@ -226,8 +227,9 @@ class TestTxPowerDemDirect(TestCase):
 
 
 class TestPolarDemSlopes(TestCase):
+    device = "cpu"
     def _plane_check(self, theta_psi):
-        device = "cpu"
+        device = self.device
         a, c, b = 0.2, -0.1, 3.0
         if theta_psi:
             grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 64,
@@ -262,13 +264,14 @@ class TestPolarDemSlopes(TestCase):
 
     def test_constant_dem_zero_slopes(self):
         grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 32, "ntheta": 64}
-        dem = torch.full((32, 64), 7.0)
+        dem = torch.full((32, 64), 7.0, device=self.device)
         dem3 = polar_dem_slopes(dem, grid)
         self.assertEqual(float(dem3[1].abs().max()), 0.0)
         self.assertEqual(float(dem3[2].abs().max()), 0.0)
 
 
 class TestTxPowerDemFfbp(TestCase):
+    device = "cpu"
     grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
 
     def _run(self, device="cpu", dem=None, normalization="sigma",
@@ -306,7 +309,7 @@ class TestTxPowerDemFfbp(TestCase):
         self.assertLess(float(err.max()), emax)
 
     def test_zero_dem_matches_no_dem(self):
-        device = "cpu"
+        device = self.device
         dem = torch.zeros(self.grid["nr"], self.grid["ntheta"], device=device)
         for norm in ["beta", "sigma", "gamma"]:
             ref = self._run(device, dem=None, normalization=norm)
@@ -315,7 +318,7 @@ class TestTxPowerDemFfbp(TestCase):
                                        equal_nan=True)
 
     def test_constant_dem_equals_shifted_pos(self):
-        device = "cpu"
+        device = self.device
         h = 6.0
         dem = torch.full((self.grid["nr"], self.grid["ntheta"]), h,
                          device=device)
@@ -332,7 +335,7 @@ class TestTxPowerDemFfbp(TestCase):
         the interpolated ffbp maps have a large relative error against near
         zero references, like the documented illumination-edge caveat. Assert
         agreement above -20 dB of the maximum for gamma."""
-        device = "cpu"
+        device = self.device
         rr, tt = _grid_axes(self.grid, device)
         dem = _terrain(rr[:, None], tt[None, :]).float()
         for norm in ["beta", "sigma", "gamma"]:
@@ -345,7 +348,7 @@ class TestTxPowerDemFfbp(TestCase):
     def test_coarse_dem_matches_direct(self):
         """A downsampled DEM through ffbp against the direct kernel with the
         same downsampled DEM."""
-        device = "cpu"
+        device = self.device
         rr, tt = _grid_axes(self.grid, device)
         dem = _terrain(rr[::4, None], tt[None, ::4]).float()
         ref = self._run(device, dem=dem, normalization="sigma", direct=True)
@@ -353,7 +356,7 @@ class TestTxPowerDemFfbp(TestCase):
         self._assert_matches(out, ref, q95=0.04, emax=0.2)
 
     def test_altitude_dem_raises(self):
-        device = "cpu"
+        device = self.device
         dem = torch.zeros(self.grid["nr"], self.grid["ntheta"], device=device)
         with self.assertRaises(NotImplementedError):
             self._run(device, dem=dem, altitude=20.0)
@@ -366,6 +369,21 @@ class TestTxPowerDemFfbp(TestCase):
         out_gpu = self._run("cuda", dem=dem.to("cuda")).cpu()
         torch.testing.assert_close(out_gpu, out_cpu, rtol=1e-3, atol=1e-5,
                                    equal_nan=True)
+
+
+@requires_cuda
+class TestTxPowerDemDirectCuda(TestTxPowerDemDirect):
+    device = "cuda"
+
+
+@requires_cuda
+class TestPolarDemSlopesCuda(TestPolarDemSlopes):
+    device = "cuda"
+
+
+@requires_cuda
+class TestTxPowerDemFfbpCuda(TestTxPowerDemFfbp):
+    device = "cuda"
 
 
 if __name__ == "__main__":

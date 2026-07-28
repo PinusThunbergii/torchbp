@@ -38,6 +38,8 @@ from torchbp.autofocus import (
 from torchbp.util import detrend
 from numpy import hamming
 
+from conftest import requires_cuda
+
 C0 = 299792458.0
 
 _scene_cache = {}
@@ -253,10 +255,12 @@ class TestSelectTargets(unittest.TestCase):
 class TestStripmapGpga(unittest.TestCase):
     """End-to-end stripmap autofocus on simulated beam-limited data."""
 
+    device = "cpu"
+
     def test_antenna_weights_match_data_envelope(self):
         # The Python antenna weight model must match the amplitude
         # envelope the C++ forward projection kernel produced.
-        s = make_scene()
+        s = make_scene(self.device)
         t = s["targets"][3][None, :]  # central target
         td = torchbp.ops.gpga_backprojection_2d_core(
             t, s["data"], s["pos_true"], s["fc"], s["r_res"],
@@ -276,7 +280,7 @@ class TestStripmapGpga(unittest.TestCase):
         self.assertLess((wn > 0.2).float().mean().item(), 0.8)
 
     def test_tde_focuses_stripmap(self):
-        s = make_scene()
+        s = make_scene(self.device)
         img_true = form_image(s, s["pos_true"])
 
         img_focus, pos_new = gpga_tde(
@@ -305,7 +309,7 @@ class TestStripmapGpga(unittest.TestCase):
     def test_gpga_focuses_stripmap(self):
         # Phase-only GPGA with the wls estimator; pd drifts at target
         # handovers with discontinuous illumination.
-        s = make_scene()
+        s = make_scene(self.device)
         img_true = form_image(s, s["pos_true"])
         img_focus, phi = gpga(
             None, s["data"], s["pos"], s["fc"], s["r_res"], s["grid_polar"],
@@ -322,6 +326,13 @@ class TestStripmapGpga(unittest.TestCase):
 
         loss = target_peaks_db(s, img_true) - target_peaks_db(s, img_focus)
         self.assertLess(np.mean(loss), 2.5)
+
+
+@requires_cuda
+class TestStripmapGpgaCuda(TestStripmapGpga):
+    """Same end-to-end autofocus on the GPU kernels."""
+
+    device = "cuda"
 
 
 def main():

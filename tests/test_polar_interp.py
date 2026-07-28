@@ -822,6 +822,194 @@ class TestPolarToCartLanczos(TestCase):
         self._opcheck("cuda")
 
 
+class TestCartToPolarLanczos(TestCase):
+    """
+    Covers the schema, CPU/CUDA equivalence, and the two properties: it must
+    invert ``polar_to_cart_lanczos`` and it must agree with the linear variant
+    on a well-oversampled smooth image.
+    """
+
+    def sample_inputs(self, device):
+        def make_tensor(size, dtype=torch.float32):
+            return torch.randn(size, device=device, dtype=dtype)
+
+        nbatch = 2
+        grid_cart = {"x": (12, 18), "y": (-5, 5), "nx": 24, "ny": 24}
+        grid_polar = {"r": (10, 20), "theta": (-0.5, 0.5), "nr": 12,
+                      "ntheta": 12}
+        origin = 0.1 * make_tensor((nbatch, 3))
+        origin[:, 2] += 4  # Offset height
+        args = {
+            "img": make_tensor(
+                (nbatch, grid_cart["nx"], grid_cart["ny"]),
+                dtype=torch.complex64),
+            "origin": origin,
+            "grid_cart": grid_cart,
+            "grid_polar": grid_polar,
+            "fc": 6e9,
+            "rotation": 0.1,
+            "alias_fmod": uniform(0, 2 * torch.pi),
+            "order": 6,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        for args in self.sample_inputs(device):
+            grid_cart = args["grid_cart"]
+            x0, x1 = grid_cart["x"]
+            y0, y1 = grid_cart["y"]
+            nx, ny = grid_cart["nx"], grid_cart["ny"]
+            dx = (x1 - x0) / nx
+            dy = (y1 - y0) / ny
+
+            grid_polar = args["grid_polar"]
+            r0, r1 = grid_polar["r"]
+            theta0, theta1 = grid_polar["theta"]
+            nr, ntheta = grid_polar["nr"], grid_polar["ntheta"]
+            dr = (r1 - r0) / nr
+            dtheta = (theta1 - theta0) / ntheta
+
+            cpp_args = (args["img"], args["origin"], 2, args["rotation"],
+                        args["fc"], x0, y0, dx, dy, nx, ny,
+                        r0, dr, theta0, dtheta, nr, ntheta,
+                        args["alias_fmod"], args["order"])
+            # test_schema only: like every other lanczos op in this file,
+            # cart_to_polar_lanczos has no register_fake kernel (only the
+            # *_linear ops do), so test_faketensor cannot pass.
+            opcheck(
+                torch.ops.torchbp.cart_to_polar_lanczos,
+                cpp_args,
+                test_utils=["test_schema"],
+            )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @requires_cuda
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+    def _shape_and_finite(self, device):
+        for args in self.sample_inputs(device):
+            out = torchbp.ops.cart_to_polar_lanczos(**args)
+            self.assertEqual(
+                tuple(out.shape),
+                (args["img"].shape[0], args["grid_polar"]["nr"],
+                 args["grid_polar"]["ntheta"]))
+            self.assertTrue(torch.isfinite(out).all())
+
+    def test_shape_cpu(self):
+        self._shape_and_finite("cpu")
+
+    @requires_cuda
+    def test_shape_cuda(self):
+        self._shape_and_finite("cuda")
+
+    @requires_cuda
+    def test_cpu_and_gpu(self):
+        for sample in self.sample_inputs("cuda"):
+            res_gpu = torchbp.ops.cart_to_polar_lanczos(**sample).cpu()
+            sample_cpu = {
+                k: v.cpu() if isinstance(v, Tensor) else v
+                for k, v in sample.items()
+            }
+            res_cpu = torchbp.ops.cart_to_polar_lanczos(**sample_cpu)
+            torch.testing.assert_close(res_cpu, res_gpu, rtol=5e-4, atol=5e-4)
+
+    def _round_trip(self, device):
+        # polar -> cart -> polar on a smooth bandlimited image recovers the
+        # input away from the grid edges, as for the linear variant.
+        grid_polar = {"r": (50.0, 100.0), "theta": (-0.5, 0.5), "nr": 128,
+                      "ntheta": 128}
+        grid_cart = {"x": (60.0, 90.0), "y": (-25.0, 25.0), "nx": 512,
+                     "ny": 512}
+        fc = 6e9
+
+        torch.manual_seed(0)
+        img = torch.randn(16, 16, dtype=torch.complex64).to(device)
+        img = torch.fft.ifft2(F.pad(torch.fft.fft2(img), (0, 112, 0, 112)))
+        img = img / img.abs().max()
+
+        origin = torch.tensor([0.0, 0.0, 30.0], device=device)
+        cart = torchbp.ops.polar_to_cart_lanczos(
+            img, origin, grid_polar, grid_cart, fc)
+        back = torchbp.ops.cart_to_polar_lanczos(
+            cart[0], origin, grid_cart, grid_polar, fc)
+
+        r = torch.linspace(*grid_polar["r"], grid_polar["nr"] + 1)[:-1]
+        t = torch.linspace(
+            *grid_polar["theta"], grid_polar["ntheta"] + 1)[:-1]
+        rg, tg = torch.meshgrid(r, t, indexing="ij")
+        x = rg * torch.sqrt(1 - tg**2)
+        y = rg * tg
+        mask = ((x > 62) & (x < 88) & (y > -23) & (y < 23)).to(device)
+        err = (back[0] - img).abs()[mask].max().item()
+        self.assertLess(err, 0.05)
+
+    def test_inverse_of_polar_to_cart_cpu(self):
+        self._round_trip("cpu")
+
+    @requires_cuda
+    def test_inverse_of_polar_to_cart_cuda(self):
+        self._round_trip("cuda")
+
+    def _matches_linear(self, device):
+        # Both kernels must recover the same polar image from a Cartesian
+        # image that actually carries the range carrier they demodulate
+        # (a carrier-free image is not a valid input: the taps are
+        # demodulated before summing, so they cancel by position).
+        # Note lanczos is not the more
+        # accurate of the two here (~1e-2 vs ~3e-3): the Cartesian grid is
+        # 4x oversampled relative to the polar one, where linear is already
+        # near-exact, while the wider 6-tap kernel reaches into cells over
+        # which the demodulated signal is no longer flat.
+        grid_polar = {"r": (50.0, 100.0), "theta": (-0.5, 0.5), "nr": 128,
+                      "ntheta": 128}
+        grid_cart = {"x": (60.0, 90.0), "y": (-25.0, 25.0), "nx": 512,
+                     "ny": 512}
+        fc = 6e9
+
+        torch.manual_seed(0)
+        img = torch.randn(16, 16, dtype=torch.complex64).to(device)
+        img = torch.fft.ifft2(F.pad(torch.fft.fft2(img), (0, 112, 0, 112)))
+        img = img / img.abs().max()
+        origin = torch.tensor([0.0, 0.0, 30.0], device=device)
+
+        cart = torchbp.ops.polar_to_cart_lanczos(
+            img, origin, grid_polar, grid_cart, fc)[0]
+
+        r = torch.linspace(*grid_polar["r"], grid_polar["nr"] + 1)[:-1]
+        t = torch.linspace(
+            *grid_polar["theta"], grid_polar["ntheta"] + 1)[:-1]
+        rg, tg = torch.meshgrid(r, t, indexing="ij")
+        x = rg * torch.sqrt(1 - tg**2)
+        y = rg * tg
+        mask = ((x > 62) & (x < 88) & (y > -23) & (y < 23)).to(device)
+
+        def recover(fn):
+            return fn(cart, origin, grid_cart, grid_polar, fc)[0]
+
+        lan = recover(torchbp.ops.cart_to_polar_lanczos)
+        lin = recover(torchbp.ops.cart_to_polar_linear)
+        e_lan = (lan - img).abs()[mask].max().item()
+        e_lin = (lin - img).abs()[mask].max().item()
+        self.assertLess(e_lan, 0.05, f"lanczos round-trip err {e_lan:.3e}")
+        self.assertLess(e_lin, 0.05, f"linear round-trip err {e_lin:.3e}")
+        # The two must land on the same image, not merely both be small:
+        # a wrong origin, rotation or carrier sign in the lanczos kernel
+        # separates them well beyond their individual errors.
+        diff = (lan - lin).abs()[mask].max().item()
+        self.assertLess(diff, 0.02,
+                        f"lanczos vs linear differ by {diff:.3e}")
+
+    def test_matches_linear_cpu(self):
+        self._matches_linear("cpu")
+
+    @requires_cuda
+    def test_matches_linear_cuda(self):
+        self._matches_linear("cuda")
+
+
 class TestFFBPMerge2Lanczos(TestCase):
     def sample_inputs(self, device, *, requires_grad=False):
         def make_tensor(size, dtype=torch.float32):

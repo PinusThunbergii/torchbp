@@ -120,7 +120,7 @@ setup(
         'test': ["pytest", "expecttest"],
         'docs':  [
             "matplotlib >=3.5",
-            "nbval >=0.9",
+            "nbval >=0.11",
             "jupyter-client >=7.3.5",
             "sphinx-rtd-theme >=1.0",
             "sphinx >=4",

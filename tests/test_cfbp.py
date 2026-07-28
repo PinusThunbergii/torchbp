@@ -8,6 +8,7 @@ from conftest import requires_cuda
 
 
 class TestCartTxPowerCFBP(TestCase):
+    device = "cpu"
     """backprojection_cart_2d_tx_power_cfbp must match the direct
     backprojection_cart_2d_tx_power."""
 
@@ -69,7 +70,7 @@ class TestCartTxPowerCFBP(TestCase):
         return out, ref
 
     def test_straight_track(self):
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device)
         grid = {"x": (45, 75), "y": (-25, 25), "nx": 128, "ny": 256}
@@ -79,7 +80,7 @@ class TestCartTxPowerCFBP(TestCase):
             self._assert_matches(out, ref, q95=0.03, emax=0.1)
 
     def test_no_azimuth_resolution(self):
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device)
         grid = {"x": (45, 75), "y": (-25, 25), "nx": 128, "ny": 256}
@@ -90,7 +91,7 @@ class TestCartTxPowerCFBP(TestCase):
     def test_downsampled_deep_stages(self):
         """Coarse subaperture maps (downsample 4) merged over many stages must
         stay accurate and free of NaN."""
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(
             device, nsweeps=512, span=60.0, alt=20.0, r_center=60.0)
@@ -164,6 +165,7 @@ class TestCartTxPowerCFBP(TestCase):
 class TestCFBP(TestCase):
     """Cartesian factorized backprojection against direct backprojection."""
 
+    device = "cpu"
     fc = 6e9
     r_res = 0.3
     grid = {"x": (60.0, 160.0), "y": (-25.0, 25.0), "nx": 256, "ny": 512}
@@ -171,6 +173,10 @@ class TestCFBP(TestCase):
 
     def _make_data(self, targets, amps, pos, d0=0.0, data_fmod=0.0):
         """Point responses consistent with the backprojection phase model."""
+        # Always synthesized on the CPU (the scatter-add below indexes with
+        # host-side index tensors) and moved at the end, so the CPU and CUDA
+        # classes run bit-identical input data.
+        targets, amps, pos = targets.cpu(), amps.cpu(), pos.cpu()
         c0 = 299792458.0
         data = torch.zeros(
             pos.shape[0], self.sweep_samples, dtype=torch.complex64
@@ -188,7 +194,7 @@ class TestCFBP(TestCase):
         if data_fmod != 0.0:
             mod = torch.exp(1j * data_fmod * torch.arange(self.sweep_samples))
             data = data * mod[None, :]
-        return data
+        return data.to(self.device)
 
     def _scene(self, nsweeps=512):
         torch.manual_seed(5)
@@ -200,7 +206,8 @@ class TestCFBP(TestCase):
         pos = torch.zeros(nsweeps, 3)
         pos[:, 1] = torch.linspace(-3.0, 3.0, nsweeps)
         pos[:, 2] = 20.0
-        return targets, amps, pos
+        return (targets.to(self.device), amps.to(self.device),
+                pos.to(self.device))
 
     def _compare(self, device, stages, nsweeps=512, grid=None, d0=0.0,
                  data_fmod=0.0, divisions=2, tol=0.05,
@@ -225,31 +232,31 @@ class TestCFBP(TestCase):
         return out
 
     def test_stages1_matches_direct(self):
-        self._compare("cpu", stages=1, tol=0.03)
+        self._compare(self.device, stages=1, tol=0.03)
 
     def test_stages2_matches_direct(self):
-        self._compare("cpu", stages=2)
+        self._compare(self.device, stages=2)
 
     def test_stages3_matches_direct(self):
         # Enough sweeps that all three stages actually recurse.
-        self._compare("cpu", stages=3, nsweeps=1040)
+        self._compare(self.device, stages=3, nsweeps=1040)
 
     def test_odd_nsweeps(self):
         # divisions does not divide nsweeps: no sweep may be dropped.
-        self._compare("cpu", stages=2, nsweeps=511)
+        self._compare(self.device, stages=2, nsweeps=511)
 
     def test_odd_ny(self):
-        self._compare("cpu", stages=2, grid=dict(self.grid, ny=255))
-        self._compare("cpu", stages=2, grid=dict(self.grid, ny=250))
+        self._compare(self.device, stages=2, grid=dict(self.grid, ny=255))
+        self._compare(self.device, stages=2, grid=dict(self.grid, ny=250))
 
     def test_divisions3(self):
-        self._compare("cpu", stages=2, nsweeps=1040, divisions=3)
+        self._compare(self.device, stages=2, nsweeps=1040, divisions=3)
 
     def test_d0(self):
-        self._compare("cpu", stages=2, d0=-0.5)
+        self._compare(self.device, stages=2, d0=-0.5)
 
     def test_data_fmod(self):
-        self._compare("cpu", stages=2, data_fmod=-torch.pi / 2)
+        self._compare(self.device, stages=2, data_fmod=-torch.pi / 2)
 
     def test_grid_object(self):
         from torchbp.grid import CartesianGrid
@@ -276,7 +283,7 @@ class TestCFBP(TestCase):
         self.assertGreater(data.grad.abs().sum().item(), 0)
 
     def test_interp_method_fft(self):
-        self._compare("cpu", stages=2, interp_method="fft")
+        self._compare(self.device, stages=2, interp_method="fft")
 
     def test_knab_matches_fft(self):
         # The merge kernel should differ from the exact FFT merge only by
@@ -391,6 +398,7 @@ class TestCFBP(TestCase):
 
     @requires_cuda
     def test_cuda_matches_direct(self):
+        # Explicitly cross-device: both devices named, not self.device.
         out_cuda = self._compare("cuda", stages=2)
         out_cpu = self._compare("cpu", stages=2)
         rel = ((out_cuda.cpu() - out_cpu).abs().max() / out_cpu.abs().max()).item()
@@ -405,6 +413,7 @@ class TestCFBPAdaptive(TestCase):
     direct backprojection.
     """
 
+    device = "cpu"
     fc = 6e9
     r_res = 0.375
     sweep_samples = 512
@@ -433,7 +442,7 @@ class TestCFBPAdaptive(TestCase):
                 w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
                 valid = (idx >= 0) & (idx < self.sweep_samples)
                 data[m_idx[valid], idx[valid]] += w[valid] * phase[valid]
-        return data, pos
+        return data.to(self.device), pos.to(self.device)
 
     def test_matches_direct_near_range(self):
         data, pos = self._scene()
@@ -470,3 +479,19 @@ class TestCFBPAdaptive(TestCase):
         self.assertGreater(ks[0], ks[-1])
 
 
+@requires_cuda
+class TestCartTxPowerCFBPCuda(TestCartTxPowerCFBP):
+    """cart_tx_power_merge2 / backprojection_cart_2d_tx_power_accum are new
+    since 27.05 and only 5 of this file's tests reached the GPU."""
+
+    device = "cuda"
+
+
+@requires_cuda
+class TestCFBPCuda(TestCFBP):
+    device = "cuda"
+
+
+@requires_cuda
+class TestCFBPAdaptiveCuda(TestCFBPAdaptive):
+    device = "cuda"

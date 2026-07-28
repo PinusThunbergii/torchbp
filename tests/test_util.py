@@ -11,6 +11,7 @@ from conftest import requires_cuda
 
 class TestBpPolarRangeDealias(TestCase):
     """bp_polar_range_dealias/alias custom op: flat and DEM-referenced carriers."""
+    device = "cpu"
 
     grid = {"r": (30.0, 60.0), "theta": (-0.5, 0.5), "nr": 32, "ntheta": 16}
     fc = 6e9
@@ -58,7 +59,7 @@ class TestBpPolarRangeDealias(TestCase):
         torch.testing.assert_close(res, ref, atol=2e-2, rtol=2e-2)
 
     def test_flat_matches_reference_cpu(self):
-        self._test_flat_matches_reference("cpu")
+        self._test_flat_matches_reference(self.device)
 
     @requires_cuda
     def test_flat_matches_reference_cuda(self):
@@ -75,7 +76,7 @@ class TestBpPolarRangeDealias(TestCase):
         torch.testing.assert_close(res, ref)
 
     def test_zero_dem_matches_no_dem_cpu(self):
-        self._test_zero_dem_matches_no_dem("cpu")
+        self._test_zero_dem_matches_no_dem(self.device)
 
     @requires_cuda
     def test_zero_dem_matches_no_dem_cuda(self):
@@ -93,7 +94,7 @@ class TestBpPolarRangeDealias(TestCase):
         torch.testing.assert_close(back, img, atol=1e-5, rtol=1e-5)
 
     def test_alias_dealias_roundtrip_cpu(self):
-        self._test_alias_dealias_roundtrip("cpu")
+        self._test_alias_dealias_roundtrip(self.device)
 
     @requires_cuda
     def test_alias_dealias_roundtrip_cuda(self):
@@ -123,15 +124,15 @@ class TestBpPolarRangeDealias(TestCase):
         torch.testing.assert_close(res, ref, atol=1e-3, rtol=1e-3)
 
     def test_matches_bp_dealias_dem_cpu(self):
-        self._test_matches_bp_dealias_dem("cpu")
+        self._test_matches_bp_dealias_dem(self.device)
 
     @requires_cuda
     def test_matches_bp_dealias_dem_cuda(self):
         self._test_matches_bp_dealias_dem("cuda")
 
     def test_opcheck(self):
-        img = self._img("cpu")
-        dem = torch.zeros(8, 4)
+        img = self._img(self.device)
+        dem = torch.zeros(8, 4, device=self.device)
         opcheck(
             torch.ops.torchbp.polar_range_dealias,
             (img, dem, 1, 32, 16, self.fc, 30.0, 30.0/32, -0.5, 1.0/16,
@@ -254,9 +255,12 @@ class TestGenerateFMCWAntennaOrientation(TestCase):
 
 
 class TestWienerNormalize(TestCase):
+    device = "cpu"
+
     def _smooth_illumination(self, nb0, nb1):
         yy, xx = torch.meshgrid(
-            torch.linspace(0, 1, nb0), torch.linspace(0, 1, nb1), indexing="ij"
+            torch.linspace(0, 1, nb0, device=self.device),
+            torch.linspace(0, 1, nb1, device=self.device), indexing="ij"
         )
         return (0.3 + 0.7 * torch.sin(xx * 3.14159) * torch.cos(0.4 * yy)).clamp_min(
             0.05
@@ -267,7 +271,7 @@ class TestWienerNormalize(TestCase):
         from torchbp.util import wiener_normalize
 
         txp = self._smooth_illumination(48, 32)
-        sar = torch.randn(48, 32, dtype=torch.complex64) * txp
+        sar = torch.randn(48, 32, dtype=torch.complex64, device=self.device) * txp
         eps = 0.05
         out = wiener_normalize(sar, txp, eps=eps)
         ref = sar * txp / (txp * txp + eps**2)
@@ -282,8 +286,10 @@ class TestWienerNormalize(TestCase):
         v = F.interpolate(
             txp[None, None], size=(128, 96), mode="bilinear", align_corners=True
         )[0, 0]
-        sar = torch.randn(128, 96, dtype=torch.complex64) * v + 0.01 * torch.randn(
-            128, 96, dtype=torch.complex64
+        sar = torch.randn(
+            128, 96, dtype=torch.complex64, device=self.device
+        ) * v + 0.01 * torch.randn(
+            128, 96, dtype=torch.complex64, device=self.device
         )
         eps = 0.05
         out = wiener_normalize(sar, txp, eps=eps)
@@ -296,7 +302,7 @@ class TestWienerNormalize(TestCase):
         from torchbp.util import wiener_normalize
 
         txp = self._smooth_illumination(9, 7)
-        sar = torch.randn(64, 48, dtype=torch.complex64)
+        sar = torch.randn(64, 48, dtype=torch.complex64, device=self.device)
         eps = 0.05
         out2d = wiener_normalize(sar, txp, eps=eps)
         out3d = wiener_normalize(sar[None], txp[None], eps=eps)
@@ -307,7 +313,7 @@ class TestWienerNormalize(TestCase):
 
         txp = self._smooth_illumination(9, 7)
         txp[:, 0] = float("nan")  # un-illuminated no-data edge
-        sar = torch.randn(64, 48, dtype=torch.complex64)
+        sar = torch.randn(64, 48, dtype=torch.complex64, device=self.device)
         out = wiener_normalize(sar, txp)  # eps auto-estimated
         self.assertEqual(out.shape, sar.shape)
         self.assertTrue(torch.isfinite(out).all())
@@ -376,3 +382,16 @@ class TestTaperAntennaPattern(TestCase):
         g2, e2 = torchbp.util.taper_antenna_pattern(g, g_extent, 0.0)
         self.assertTrue(torch.equal(g2, g))
         self.assertEqual(e2, [-0.4, -0.8, 0.4, 0.8])
+
+
+@requires_cuda
+class TestBpPolarRangeDealiasCuda(TestBpPolarRangeDealias):
+    device = "cuda"
+
+
+@requires_cuda
+class TestWienerNormalizeCuda(TestWienerNormalize):
+    """wiener_normalize dispatches to mul_2d_interp_linear /
+    div_2d_interp_linear, which have CUDA kernels."""
+
+    device = "cuda"

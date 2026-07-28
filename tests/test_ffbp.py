@@ -12,6 +12,7 @@ from conftest import requires_cuda
 
 class TestFfbpDem(TestCase):
     """DEM support through the full ffbp merge tree."""
+    device = "cpu"
 
     def _random_scene(self, device):
         torch.manual_seed(11)
@@ -42,7 +43,7 @@ class TestFfbpDem(TestCase):
             1e-3)
 
     def test_constant_dem_equals_shifted_pos_cpu(self):
-        self._test_constant_dem_equals_shifted_pos("cpu")
+        self._test_constant_dem_equals_shifted_pos(self.device)
 
     @requires_cuda
     def test_constant_dem_equals_shifted_pos_cuda(self):
@@ -131,7 +132,7 @@ class TestFfbpDem(TestCase):
             self.assertLessEqual(abs(pt - it), 2)
 
     def test_ffbp_dem_matches_direct_bp_cpu(self):
-        self._test_ffbp_dem_matches_direct_bp("cpu")
+        self._test_ffbp_dem_matches_direct_bp(self.device)
 
     @requires_cuda
     def test_ffbp_dem_matches_direct_bp_cuda(self):
@@ -140,7 +141,7 @@ class TestFfbpDem(TestCase):
     def test_afbp_base_matches_direct_base(self):
         # ffbp with the afbp base level and a DEM must match ffbp with the
         # direct backprojection base level.
-        data, grid, fc, r_res, pos, dem, tr, tth = self._terrain_scene("cpu")
+        data, grid, fc, r_res, pos, dem, tr, tth = self._terrain_scene(self.device)
         img1 = torchbp.ops.ffbp(data, grid, fc, r_res, pos, stages=3,
                                 dem=dem)
         img2 = torchbp.ops.ffbp(data, grid, fc, r_res, pos, stages=3,
@@ -151,6 +152,7 @@ class TestFfbpDem(TestCase):
 
 class TestFFBPAntennaPattern(TestCase):
     """End-to-end antenna-pattern-weighted FFBP must match between CPU and CUDA."""
+    device = "cpu"
 
     @staticmethod
     def _make_inputs(device):
@@ -222,7 +224,7 @@ class TestFFBPAntennaPattern(TestCase):
         """Weighted FFBP at downsample=1 must stay bounded at swath
         edges instead of producing a large spike from dividing by near-zero
         illumination."""
-        a = self._make_narrow_beam_inputs("cpu")
+        a = self._make_narrow_beam_inputs(self.device)
         kw = dict(stages=3, divisions=2, dealias=True,
                   att=a["att"], g=a["g"], g_extent=a["g_extent"])
         img = torchbp.ops.ffbp(a["data"], a["grid"], a["fc"], a["r_res"], a["pos"],
@@ -257,6 +259,7 @@ class TestFFBPAntennaPattern(TestCase):
 
 class TestFfbpDataInterpMethod(TestCase):
     """data_interp_method plumbing to the base level backprojections."""
+    device = "cpu"
 
     fc = 6e9
     r_res = 0.5
@@ -389,6 +392,7 @@ class TestFfbpFrameOrigin(TestCase):
     """ffbp must reference the output grid to the coordinate frame origin
     like backprojection_polar_2d, not to the mean of the input positions.
     """
+    device = "cpu"
 
     def _scene(self, device):
         c0 = 299792458.0
@@ -442,12 +446,12 @@ class TestFfbpFrameOrigin(TestCase):
         self.assertGreater(rel(out_off, out0), 0.5)
 
     def test_nonzero_mean_pos_matches_bp_cpu(self):
-        self._test_nonzero_mean_pos_matches_bp("cpu", divisions=2)
+        self._test_nonzero_mean_pos_matches_bp(self.device, divisions=2)
 
     def test_nonzero_mean_pos_matches_bp_divisions3_cpu(self):
         # Odd image count exercises the trailing-image reduction path with
         # the frame-origin final merge.
-        self._test_nonzero_mean_pos_matches_bp("cpu", divisions=3)
+        self._test_nonzero_mean_pos_matches_bp(self.device, divisions=3)
 
     @requires_cuda
     def test_nonzero_mean_pos_matches_bp_cuda(self):
@@ -508,6 +512,7 @@ class TestComputeIllumination(TestCase):
 
 class TestFFBPTxPower(TestCase):
     """backprojection_polar_2d_tx_power_ffbp must match the direct backprojection_polar_2d_tx_power."""
+    device = "cpu"
 
     @staticmethod
     def _antenna(device, az_width=0.25, el_width=0.8):
@@ -574,7 +579,7 @@ class TestFFBPTxPower(TestCase):
         return out, ref
 
     def test_straight_track(self):
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device)
         grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
@@ -586,7 +591,7 @@ class TestFFBPTxPower(TestCase):
         """Subapertures at the track ends see the scene at local theta far
         outside the narrow output theta range. A shared theta grid would lose
         their contributions entirely."""
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.8)
         wa, pos, att = self._straight_track(
             device, nsweeps=256, span=300.0, alt=20.0, r_center=120.0)
@@ -597,7 +602,7 @@ class TestFFBPTxPower(TestCase):
         self._assert_matches(out, ref, q95=0.03, emax=0.1, min_ratio=0.9)
 
     def test_curved_track(self):
-        device = "cpu"
+        device = self.device
         torch.manual_seed(0)
         nsweeps = 256
         g, g_extent = self._antenna(device, az_width=0.5)
@@ -623,7 +628,7 @@ class TestFFBPTxPower(TestCase):
         pulse weight underflows to zero) and undersample the illumination
         rolloff in the subaperture maps. Both showed up as heavy azimuth
         errors that grew with the number of stages."""
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.05)
         wa, pos, att = self._straight_track(
             device, nsweeps=512, span=100.0, alt=40.0, r_center=150.0)
@@ -652,11 +657,12 @@ class TestFFBPTxPower(TestCase):
         NaN moments in either the direct kernel or the accumulator maps."""
         from torchbp.ops.backproj import _backprojection_polar_2d_tx_power_accum
 
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.1)
         g = torch.where(g > 1e-3 * g.max(), g, torch.zeros_like(g))
         wa, pos, att = self._straight_track(device, nsweeps=128)
-        wa = torch.hann_window(128).to(torch.float32)  # exact zero endpoints
+        # exact zero endpoints
+        wa = torch.hann_window(128, device=device).to(torch.float32)
         grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 64, "ntheta": 128}
         acc = _backprojection_polar_2d_tx_power_accum(
             wa, g, g_extent, grid, pos, att, "sigma", (80 - 40) / 64, 20.0)
@@ -669,7 +675,7 @@ class TestFFBPTxPower(TestCase):
         self.assertGreater(int((torch.isfinite(ref) & (acc[1] > 0)).sum()), 1000)
 
     def test_slant(self):
-        device = "cpu"
+        device = self.device
         alt = 30.0
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device, alt=0.0, r_center=60.0)
@@ -678,8 +684,8 @@ class TestFFBPTxPower(TestCase):
         out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
                                   normalization="sigma", altitude=alt)
         # Shadow zone below nadir must be exactly zero in both.
-        r_vec = 25 + (90 - 25) / 96 * torch.arange(96)
-        t_vec = -0.5 + 1.0 / 128 * torch.arange(128)
+        r_vec = 25 + (90 - 25) / 96 * torch.arange(96, device=device)
+        t_vec = -0.5 + 1.0 / 128 * torch.arange(128, device=device)
         rg2 = r_vec[:, None] ** 2 * (1 - t_vec[None, :] ** 2) - alt**2
         shadow = rg2 < 0
         self.assertGreater(int(shadow.sum()), 0)
@@ -695,7 +701,7 @@ class TestFFBPTxPower(TestCase):
         self._assert_matches(out, ref, q95=0.04, emax=0.15)
 
     def test_normalization_variants(self):
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device, nsweeps=64)
         grid = {"r": (40, 80), "theta": (-0.4, 0.4), "nr": 48, "ntheta": 64}
@@ -705,7 +711,7 @@ class TestFFBPTxPower(TestCase):
             self._assert_matches(out, ref, q95=0.03, emax=0.1)
 
     def test_azimuth_resolution_false(self):
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device)
         grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
@@ -716,7 +722,7 @@ class TestFFBPTxPower(TestCase):
 
     def test_downsampled_subaperture_maps(self):
         """Coarse subaperture maps must stay reasonably accurate."""
-        device = "cpu"
+        device = self.device
         g, g_extent = self._antenna(device, az_width=0.4)
         wa, pos, att = self._straight_track(device)
         grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
@@ -751,7 +757,7 @@ class TestFFBPTxPower(TestCase):
             merged[:, 1:-1, 1:-1], full[:, 1:-1, 1:-1], atol=1e-5, rtol=1e-2)
 
     def test_merge_exactness_cpu(self):
-        self._merge_exactness("cpu")
+        self._merge_exactness(self.device)
 
     @requires_cuda
     def test_merge_exactness_cuda(self):
@@ -902,6 +908,7 @@ class TestFFBPLongBaseline(TestCase):
     grids must extend in range so the merge lookups stay inside them,
     otherwise edge targets at high |theta| lose the contribution of the
     offset subapertures and dim. See the range guard band in _ffbp_impl."""
+    device = "cpu"
 
     fc = 6e9
     r_res = 0.5
@@ -1115,3 +1122,36 @@ class TestTxPowerPitch(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_cuda
+class TestFfbpDemCuda(TestFfbpDem):
+    device = "cuda"
+
+
+@requires_cuda
+class TestFFBPAntennaPatternCuda(TestFFBPAntennaPattern):
+    device = "cuda"
+
+
+@requires_cuda
+class TestFfbpDataInterpMethodCuda(TestFfbpDataInterpMethod):
+    device = "cuda"
+
+
+@requires_cuda
+class TestFfbpFrameOriginCuda(TestFfbpFrameOrigin):
+    device = "cuda"
+
+
+@requires_cuda
+class TestFFBPTxPowerCuda(TestFFBPTxPower):
+    """The tx_power kernel gained pitch support, azimuth-resolution
+    normalization and a min_look_angle unit fix, all CPU-tested only."""
+
+    device = "cuda"
+
+
+@requires_cuda
+class TestFFBPLongBaselineCuda(TestFFBPLongBaseline):
+    device = "cuda"

@@ -112,7 +112,7 @@ def _dem_row_mean(dem: Tensor, nr: int) -> Tensor:
     DEM rows by the same index-ratio convention as the kernel sampling."""
     zr = dem.double().mean(dim=1).cpu()
     dem_nr = zr.shape[0]
-    fr = torch.arange(nr, dtype=torch.float64) * (dem_nr / nr)
+    fr = torch.arange(nr, dtype=torch.float64, device=zr.device) * (dem_nr / nr)
     i0 = fr.long().clamp(max=dem_nr - 1)
     i1 = (i0 + 1).clamp(max=dem_nr - 1)
     return torch.lerp(zr[i0], zr[i1], fr - i0)
@@ -426,7 +426,9 @@ def afbp(
     # the within-row terrain variation remains as patch misplacement (see
     # the dem docstring). fac is the swath center value used by the split
     # sizing and validity checks.
-    r_rows = r0 + dr * torch.arange(nr, dtype=torch.float64)
+    # Host-side sizing arithmetic: keep it on the CPU like _dem_row_mean,
+    # so it is unaffected by torch.set_default_device.
+    r_rows = r0 + dr * torch.arange(nr, dtype=torch.float64, device="cpu")
     zz_rows = z0 - _dem_row_mean(dem, nr) if dem is not None else z0
     rd_rows = r_rows / torch.sqrt(r_rows**2 + zz_rows**2)
     fac = float(rd_rows[nr // 2])

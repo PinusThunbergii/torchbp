@@ -24,6 +24,8 @@ from torch.testing._internal.common_utils import TestCase
 
 import torchbp
 
+from conftest import requires_cuda
+
 C0 = 299792458.0
 
 
@@ -43,6 +45,7 @@ def _beam(el_width, az_width, az_offset, device):
 
 
 class TestWeightedFfbpDem(TestCase):
+    device = "cpu"
     fc = 6e9
     bw = 200e6
     tsweep = 100e-6
@@ -122,18 +125,20 @@ class TestWeightedFfbpDem(TestCase):
     # ------------------------------------------------------------------
 
     def test_bp_gain_constant_dem_equals_shifted_pos(self):
-        device = "cpu"
+        device = self.device
         torch.manual_seed(3)
-        data = torch.randn(self.nsweeps, 500, dtype=torch.complex64)
+        data = torch.randn(self.nsweeps, 500, dtype=torch.complex64,
+                           device=device)
         pos = torch.zeros(self.nsweeps, 3, device=device)
-        pos[:, 1] = torch.linspace(-5, 5, self.nsweeps)
+        pos[:, 1] = torch.linspace(-5, 5, self.nsweeps, device=device)
         pos[:, 2] = self.alt
         g, g_extent = _beam(0.8, 0.25, 0.0, device)
-        att = torch.zeros(self.nsweeps, 3)
+        att = torch.zeros(self.nsweeps, 3, device=device)
         att[:, 0] = -float(np.arcsin(self.alt / 80.0))
 
         h = 9.0
-        dem = torch.full((self.grid["nr"], self.grid["ntheta"]), h)
+        dem = torch.full((self.grid["nr"], self.grid["ntheta"]), h,
+                         device=device)
         res = torchbp.ops.backprojection_polar_2d(
             data, self.grid, self.fc, self.r_res, pos,
             att=att, g=g, g_extent=g_extent, dem=dem)[0]
@@ -146,19 +151,21 @@ class TestWeightedFfbpDem(TestCase):
         self.assertLess(rel, 1e-3)
 
     def test_weighted_ffbp_constant_dem_equals_shifted_pos(self):
-        device = "cpu"
+        device = self.device
         torch.manual_seed(3)
-        data = torch.randn(self.nsweeps, 500, dtype=torch.complex64)
+        data = torch.randn(self.nsweeps, 500, dtype=torch.complex64,
+                           device=device)
         pos = torch.zeros(self.nsweeps, 3, device=device)
-        pos[:, 1] = torch.linspace(-5, 5, self.nsweeps)
+        pos[:, 1] = torch.linspace(-5, 5, self.nsweeps, device=device)
         pos[:, 2] = self.alt
         g, g_extent = _beam(0.8, 0.25, 0.0, device)
-        att = torch.zeros(self.nsweeps, 3)
+        att = torch.zeros(self.nsweeps, 3, device=device)
         att[:, 0] = -float(np.arcsin(self.alt / 80.0))
         kw = dict(stages=3, dealias=True, att=att, g=g, g_extent=g_extent)
 
         h = 9.0
-        dem = torch.full((self.grid["nr"], self.grid["ntheta"]), h)
+        dem = torch.full((self.grid["nr"], self.grid["ntheta"]), h,
+                         device=device)
         res = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
                                dem=dem, **kw)
         pos_shift = pos.clone()
@@ -174,7 +181,7 @@ class TestWeightedFfbpDem(TestCase):
     # ------------------------------------------------------------------
 
     def test_weighted_ffbp_dem_matches_direct_bp(self):
-        device = "cpu"
+        device = self.device
         data, pos, att, g, g_extent, dem, tr, tth = self._scene(device)
         img_bp = torchbp.ops.backprojection_polar_2d(
             data, self.grid, self.fc, self.r_res, pos,
@@ -222,7 +229,7 @@ class TestWeightedFfbpDem(TestCase):
     # ------------------------------------------------------------------
 
     def test_channel_balance_matches_direct_bp(self):
-        device = "cpu"
+        device = self.device
         beams = [
             dict(el_width=0.8, az_width=0.25, az_offset=0.0),
             dict(el_width=0.6, az_width=0.15, az_offset=0.05),
@@ -242,17 +249,23 @@ class TestWeightedFfbpDem(TestCase):
         for (ir, it) in self._target_pixels(tr, tth):
             # Same pixel for all four images: peak of the first BP channel.
             pr, pt = self._peak_pixel(imgs_bp[0], ir, it)
-            ratio_bp = (imgs_bp[0][pr, pt] / imgs_bp[1][pr, pt])
-            ratio_ff = (imgs_ffbp[0][pr, pt] / imgs_ffbp[1][pr, pt])
+            ratio_bp = (imgs_bp[0][pr, pt] / imgs_bp[1][pr, pt]).item()
+            ratio_ff = (imgs_ffbp[0][pr, pt] / imgs_ffbp[1][pr, pt]).item()
             bal_db = 20 * np.log10(abs(ratio_ff) / abs(ratio_bp))
-            phase_deg = np.angle(
-                (ratio_ff / ratio_bp).item(), deg=True)
+            phase_deg = np.angle(ratio_ff / ratio_bp, deg=True)
             self.assertLess(abs(bal_db), 0.5,
                             f"channel balance off by {bal_db:.2f} dB at "
                             f"target pixel ({pr}, {pt})")
             self.assertLess(abs(phase_deg), 5.0,
                             f"channel phase off by {phase_deg:.2f} deg at "
                             f"target pixel ({pr}, {pt})")
+
+
+@requires_cuda
+class TestWeightedFfbpDemCuda(TestWeightedFfbpDem):
+    """Same checks against the CUDA backprojection / merge kernels."""
+
+    device = "cuda"
 
 
 if __name__ == "__main__":

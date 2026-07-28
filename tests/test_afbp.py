@@ -9,13 +9,18 @@ from conftest import requires_cuda
 class TestAFBP(TestCase):
     """afbp must match direct polar backprojection including pixel phase."""
 
+    #: Device the scene builders place their tensors on. The CUDA subclass
+    #: at the bottom of the file re-runs the whole class on the GPU, where
+    #: afbp takes the batched fusion path instead of the afbp_fuse op.
+    device = "cpu"
     fc = 6e9
     r_res = 0.5
     nsamples = 512
     nsweeps = 256
     grid = {"r": (100.0, 200.0), "theta": (-0.2, 0.2), "nr": 128, "ntheta": 128}
 
-    def _scene(self, device="cpu", z0=0.0):
+    def _scene(self, device=None, z0=0.0):
+        device = self.device if device is None else device
         c0 = 299792458.0
         lam = c0 / self.fc
         pos = torch.zeros((self.nsweeps, 3), device=device)
@@ -126,9 +131,9 @@ class TestAFBP(TestCase):
 
     def test_antenna_pattern_unnormalized(self):
         data, pos = self._scene(z0=30.0)
-        att = torch.zeros((self.nsweeps, 3))
-        el = torch.linspace(-1.0, 1.0, 16)
-        az = torch.linspace(-1.2, 1.2, 64)
+        att = torch.zeros((self.nsweeps, 3), device=self.device)
+        el = torch.linspace(-1.0, 1.0, 16, device=self.device)
+        az = torch.linspace(-1.2, 1.2, 64, device=self.device)
         g = torch.exp(-el[:, None] ** 2 / 0.8) * torch.exp(-az[None, :] ** 2 / 0.5)
         g_extent = [-1.0, -1.2, 1.0, 1.2]
         ref = torchbp.ops.backprojection_polar_2d(
@@ -187,7 +192,10 @@ class TestAFBP(TestCase):
             env = torch.special.sinc((i[None, :] * self.r_res - d[:, None]) / (2 * self.r_res))
             ph = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)[:, None]
             data += (env * ph).to(torch.complex64)
-        return data, pos, self._dem()
+        # Built on the CPU either way, so both devices see the identical
+        # scene and a failure is a kernel difference, not a different scene.
+        dev = self.device
+        return data.to(dev), pos.to(dev), self._dem().to(dev)
 
     def test_matches_direct_dem_cpu(self):
         for dealias in (False, True):
@@ -223,9 +231,9 @@ class TestAFBP(TestCase):
 
     def test_antenna_pattern_dem(self):
         data, pos, dem = self._dem_scene()
-        att = torch.zeros((self.nsweeps, 3))
-        el = torch.linspace(-1.0, 1.0, 16)
-        az = torch.linspace(-1.2, 1.2, 64)
+        att = torch.zeros((self.nsweeps, 3), device=self.device)
+        el = torch.linspace(-1.0, 1.0, 16, device=self.device)
+        az = torch.linspace(-1.2, 1.2, 64, device=self.device)
         g = torch.exp(-el[:, None] ** 2 / 0.8) * torch.exp(-az[None, :] ** 2 / 0.5)
         g_extent = [-1.0, -1.2, 1.0, 1.2]
         ref = torchbp.ops.backprojection_polar_2d(
@@ -294,9 +302,9 @@ class TestAFBP(TestCase):
         # there is no step and no warning.
         import warnings as _warnings
         data, pos = self._scene()
-        att = torch.zeros((self.nsweeps, 3))
-        el = torch.linspace(-1.0, 1.0, 8)
-        az = torch.linspace(-0.1, 0.1, 16)
+        att = torch.zeros((self.nsweeps, 3), device=self.device)
+        el = torch.linspace(-1.0, 1.0, 8, device=self.device)
+        az = torch.linspace(-0.1, 0.1, 16, device=self.device)
         g = torch.exp(-el[:, None] ** 2) * torch.exp(-az[None, :] ** 2)
         g_extent = [-1.0, -0.1, 1.0, 0.1]
         with self.assertWarnsRegex(UserWarning, "gain table ends inside"):
@@ -333,11 +341,11 @@ class TestAFBP(TestCase):
         # weighted ffbp: afbp feeds the same unnormalized accumulation into
         # the weight-map Wiener normalization.
         data, pos = self._scene(z0=30.0)
-        att = torch.zeros((self.nsweeps, 3))
+        att = torch.zeros((self.nsweeps, 3), device=self.device)
         att[:, 2] = 0.05 * torch.sin(
             2 * torch.pi * torch.arange(self.nsweeps) / self.nsweeps)
-        el = torch.linspace(-1.0, 1.0, 16)
-        az = torch.linspace(-1.2, 1.2, 64)
+        el = torch.linspace(-1.0, 1.0, 16, device=self.device)
+        az = torch.linspace(-1.2, 1.2, 64, device=self.device)
         g = torch.exp(-el[:, None] ** 2 / 0.8) * torch.exp(-az[None, :] ** 2 / 0.35)
         g_extent = [-1.0, -1.2, 1.0, 1.2]
         img1 = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
@@ -420,11 +428,16 @@ class TestAFBP(TestCase):
         rr = r0 + (r1 - r0) / 64 * torch.arange(64, dtype=torch.float64)
         ttg = t0 + (t1 - t0) / 64 * torch.arange(64, dtype=torch.float64)
         dem = terrain(rr[:, None], ttg[None, :]).float()
-        att = torch.zeros((nsweeps, 3))
-        el = torch.linspace(-1.2, 1.2, 16)
+        # Local scene built on the CPU (seeded generator): move it so both
+        # devices run the identical scene.
+        data = data.to(self.device)
+        pos = pos.to(self.device)
+        dem = dem.to(self.device)
+        att = torch.zeros((nsweeps, 3), device=self.device)
+        el = torch.linspace(-1.2, 1.2, 16, device=self.device)
         # Azimuth extent 0.6 rad: hard cutoff at theta = sin(0.6) = 0.565,
         # inside the +-0.8 scene extent.
-        az = torch.linspace(-0.6, 0.6, 64)
+        az = torch.linspace(-0.6, 0.6, 64, device=self.device)
         g = torch.exp(-el[:, None] ** 2 / 1.0) * torch.exp(-az[None, :] ** 2 / 0.8)
         g_extent = [-1.2, -0.6, 1.2, 0.6]
         kw = dict(stages=2, dealias=True, grid_oversample=1.5,
@@ -443,11 +456,11 @@ class TestAFBP(TestCase):
         # test_ffbp_afbp_base_dem (terrain-slope amplitude error of the
         # afbp fusion).
         data, pos, dem = self._dem_scene()
-        att = torch.zeros((self.nsweeps, 3))
+        att = torch.zeros((self.nsweeps, 3), device=self.device)
         att[:, 2] = 0.05 * torch.sin(
             2 * torch.pi * torch.arange(self.nsweeps) / self.nsweeps)
-        el = torch.linspace(-1.0, 1.0, 16)
-        az = torch.linspace(-1.2, 1.2, 64)
+        el = torch.linspace(-1.0, 1.0, 16, device=self.device)
+        az = torch.linspace(-1.2, 1.2, 64, device=self.device)
         g = torch.exp(-el[:, None] ** 2 / 0.8) * torch.exp(-az[None, :] ** 2 / 0.35)
         g_extent = [-1.0, -1.2, 1.0, 1.2]
         img1 = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
@@ -461,3 +474,13 @@ class TestAFBP(TestCase):
         self.assertLess(rel, 3e-2)
 
 
+
+@requires_cuda
+class TestAFBPCuda(TestAFBP):
+    """The whole class on the GPU.
+
+    The scenes are built on the CPU and moved, so both
+    classes run on bit-identical inputs.
+    """
+
+    device = "cuda"

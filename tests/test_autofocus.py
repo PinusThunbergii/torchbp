@@ -3,6 +3,8 @@ import torch
 from torch.testing._internal.common_utils import TestCase
 import torchbp
 
+from conftest import requires_cuda
+
 
 class TestInsarRmeBlocksvd(TestCase):
     """End-to-end InSAR RME on synthetic point-scatterer data."""
@@ -883,3 +885,85 @@ class TestPhaseToPos(TestCase):
             phi2, self.grid, self.fc, pos, shifted=False
         )
         self.assertLess((dx_est - dx_est2).abs().max().item(), 1e-5)
+
+
+# ----------------------------------------------------------------------
+# CUDA re-runs.
+#
+# The tests above build every tensor with the default-device factory
+# functions, so pointing the default device at the GPU re-runs the whole
+# file against the CUDA kernels without duplicating any scene setup.
+# ----------------------------------------------------------------------
+
+
+class _OnCuda:
+    """Run the parent class's tests with the default device on the GPU.
+
+    The random draws are additionally forced through the CPU generator, so
+    each CUDA test sees the *same* scene as its CPU counterpart: a failure
+    here is a kernel difference and not a different random scene.
+    """
+
+    _rng_fns = ("randn", "rand", "randint", "randperm")
+
+    def setUp(self):
+        self._orig_rng = {n: getattr(torch, n) for n in self._rng_fns}
+        for name, fn in self._orig_rng.items():
+            def wrapper(*args, _fn=fn, **kwargs):
+                device = kwargs.pop("device", None)
+                return _fn(*args, device="cpu", **kwargs).to(
+                    torch.get_default_device() if device is None else device)
+            setattr(torch, name, wrapper)
+        torch.set_default_device("cuda")
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        torch.set_default_device("cpu")
+        for name, fn in self._orig_rng.items():
+            setattr(torch, name, fn)
+
+
+@requires_cuda
+class TestInsarRmeBlocksvdCuda(_OnCuda, TestInsarRmeBlocksvd):
+    pass
+
+
+@requires_cuda
+class TestPgaCuda(_OnCuda, TestPga):
+    pass
+
+
+@requires_cuda
+class TestPgaWindowEstimateCuda(_OnCuda, TestPgaWindowEstimate):
+    pass
+
+
+@requires_cuda
+class TestPgaXzCuda(_OnCuda, TestPgaXz):
+    pass
+
+
+@requires_cuda
+class TestGpgaBpPolarCuda(_OnCuda, TestGpgaBpPolar):
+    pass
+
+
+@requires_cuda
+class TestGpgaBpPolarTdeCuda(_OnCuda, TestGpgaBpPolarTde):
+    pass
+
+
+@requires_cuda
+class TestGpgaCartesianCuda(_OnCuda, TestGpgaCartesian):
+    pass
+
+
+@requires_cuda
+class TestGpgaDemCuda(_OnCuda, TestGpgaDem):
+    pass
+
+
+@requires_cuda
+class TestPhaseToPosCuda(_OnCuda, TestPhaseToPos):
+    pass
