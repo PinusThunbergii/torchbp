@@ -354,7 +354,7 @@ def afbp(
             raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
         if dem.dtype != torch.float32:
             raise ValueError(f"dem must be float32, got {dem.dtype}")
-        if dem.device != data.device:
+        if (dem.device.type, dem.device.index or 0) != (data.device.type, data.device.index or 0):
             raise ValueError(f"dem must be on the same device as data ({data.device}), got {dem.device}")
     # The wavenumber-domain fusion gathers pulses with an index tensor, so
     # a lazy input is materialized whole here: afbp accepts LazyData but is

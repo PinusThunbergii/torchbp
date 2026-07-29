@@ -1431,11 +1431,32 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
 }
 
 
+// The subaperture image's local range spectrum at a lookup is shifted from
+// the dealias-reference baseband by the aperture average of d(R_sweep)/dr
+// minus d(R_origin)/dr. To second order in the sweep along-track offsets y
+// (m2 = variance of y about the subaperture origin, meters^2):
+//   nu = 2k * f''(0) * m2/2 * dr_child   [rad per range sample]
+//   f''(0) = -(rp/rpz^3) * (1 + tp^2 * (2 - 3 rp^2/rpz^2))
+// Negligible at far range, but at the top merges with |dy| ~ rp it walks
+// the spectrum out of the interpolator's assumed band; the interpolation
+// taps are demodulated by nu to recenter it.
+static __device__ __forceinline__ float ffbp_merge2_range_fmod(
+        float m2, float rp, float tp, float rpz, float ref_phase, float dr_c) {
+    if (m2 == 0.0f) {
+        return 0.0f;
+    }
+    const float rpz2 = rpz * rpz;
+    const float fpp = -(rp / (rpz2 * rpz)) *
+        (1.0f + tp * tp * (2.0f - 3.0f * rp * rp / rpz2));
+    return kPI * ref_phase * 0.5f * m2 * fpp * dr_c;
+}
+
 __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64_t *img1,
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, int alias, float alias_fmod,
+        float dtheta1, int Nr1, int Ntheta1, float z1, float m2_0, float m2_1,
+        int order, float knab_v, int alias, float alias_fmod,
         const float *dem, float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
@@ -1482,12 +1503,14 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
         const float dti = (tp - theta0[id]) / dtheta[id];
 
         if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
-            complex64_t v = knab_interp_2d<complex64_t, complex64_t>(
-                    img, Nr[id], Ntheta[id], dri, dti, order, knab_v, knab_norm);
-
-            float ref_sin, ref_cos;
             const float z0 = z1 + dorigin[id * 3 + 2] - zp;
             const float rpz = sqrtf(z0*z0 + rp*rp);
+            const float nu = ffbp_merge2_range_fmod(
+                    id == 0 ? m2_0 : m2_1, rp, tp, rpz, ref_phase, dr[id]);
+            complex64_t v = knab_interp_2d_fmod<complex64_t, complex64_t>(
+                    img, Nr[id], Ntheta[id], dri, dti, order, knab_v, knab_norm, nu);
+
+            float ref_sin, ref_cos;
             sincospif(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             pixel += v * ref;
@@ -1516,7 +1539,8 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod,
+        float dtheta1, int Nr1, int Ntheta1, float z1, float m2_0, float m2_1,
+        int order, int alias, float alias_fmod,
         const float *dem, float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
@@ -1562,12 +1586,14 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
         const float dti = (tp - theta0[id]) / dtheta[id];
 
         if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
-            complex64_t v = interp_2d_poly<complex64_t, complex64_t, N_COEFS>(
-                    img, Nr[id], Ntheta[id], dri, dti, order);
-
-            float ref_sin, ref_cos;
             const float z0 = z1 + dorigin[id * 3 + 2] - zp;
             const float rpz = sqrtf(z0*z0 + rp*rp);
+            const float nu = ffbp_merge2_range_fmod(
+                    id == 0 ? m2_0 : m2_1, rp, tp, rpz, ref_phase, dr[id]);
+            complex64_t v = interp_2d_poly_fmod<complex64_t, complex64_t, N_COEFS>(
+                    img, Nr[id], Ntheta[id], dri, dti, order, nu);
+
+            float ref_sin, ref_cos;
             sincospif(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             pixel += v * ref;
@@ -1607,7 +1633,7 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
         const float *r0, const float *dr, const float *theta0, const float *dtheta,
         const int *Nr, const int *Ntheta,
         float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
-        float z1, int order, int alias, float alias_fmod,
+        float z1, float m2_0, float m2_1, int order, int alias, float alias_fmod,
         // Weight map parameters for img0
         const float *w1_map0, const float *w2_map0,
         float w_r0_0, float w_dr0, float w_theta0_0, float w_dtheta0,
@@ -1695,12 +1721,14 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
         const float dti = (tp - theta0_val) / dtheta_val;
 
         if (dri >= 0 && dri < Nr_val-1 && dti >= 0 && dti < Ntheta_val-1) {
-            complex64_t v = interp_2d_poly<complex64_t, complex64_t, N_COEFS>(
-                    img, Nr_val, Ntheta_val, dri, dti, order);
-
-            float ref_sin, ref_cos;
             const float z0 = z1 + dorig2 - zp;
             const float rpz = hypotf(z0, rp);
+            const float nu = ffbp_merge2_range_fmod(
+                    id == 0 ? m2_0 : m2_1, rp, tp, rpz, ref_phase, dr_val);
+            complex64_t v = interp_2d_poly_fmod<complex64_t, complex64_t, N_COEFS>(
+                    img, Nr_val, Ntheta_val, dri, dti, order, nu);
+
+            float ref_sin, ref_cos;
             const float phase_angle = fmaf(ref_phase, rpz - dz, -alias_fmod * (dri - idr)) * M_PI;
             __sincosf(phase_angle, &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -2064,7 +2092,9 @@ at::Tensor ffbp_merge2_knab_cuda(
           double oversample,
           int64_t alias,
           double alias_fmod,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          double m2_0,
+          double m2_1) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2150,6 +2180,8 @@ at::Tensor ffbp_merge2_knab_cuda(
                   Nr1,
                   Ntheta1,
                   z1,
+                  (float)m2_0,
+                  (float)m2_1,
                   order,
                   v,
                   alias,
@@ -2181,7 +2213,9 @@ at::Tensor ffbp_merge2_poly_cuda(
           const at::Tensor &poly_coefs,
           int64_t alias,
           double alias_fmod,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          double m2_0,
+          double m2_1) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2266,7 +2300,8 @@ at::Tensor ffbp_merge2_poly_cuda(
             (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
             (complex64_t*)out_ptr, dorigin_ptr, ref_phase, \
             r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, \
+            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, \
+            (float)m2_0, (float)m2_1, order, alias, alias_fmod/kPI, \
             dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
 
     switch (n_coefs) {
@@ -2323,7 +2358,9 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
           int64_t w_nr1, int64_t w_ntheta1,
           int64_t output_weight_map,
           int64_t output_weight_decimation,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          double m2_0,
+          double m2_1) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2457,7 +2494,8 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
             (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
             (complex64_t*)out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
             r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, \
+            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, \
+            (float)m2_0, (float)m2_1, order, alias, alias_fmod/kPI, \
             w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0, \
             w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1, \
             dec, \

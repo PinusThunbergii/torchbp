@@ -515,7 +515,7 @@ def ffbp(
             raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
         if dem.dtype != torch.float32:
             raise ValueError(f"dem must be float32, got {dem.dtype}")
-        if dem.device != data.device:
+        if (dem.device.type, dem.device.index or 0) != (data.device.type, data.device.index or 0):
             raise ValueError(f"dem must be on the same device as data ({data.device}), got {dem.device}")
 
     if nsweeps < divisions:
@@ -1059,8 +1059,18 @@ def _ffbp_impl(
                     "ntheta": out_ntheta,
                 }
 
+        # Along-track centroid and variance of the subaperture's pulses in
+        # the top-level frame (variance is frame-invariant): the merges use
+        # the variance to compensate the aperture-averaged range-spectrum
+        # shift of the child image at close-range lookups (see
+        # ffbp_merge2_range_fmod in the kernels). Python floats so the
+        # merge chain stays sync-free.
+        n_loc = len(pos_xy_local)
+        cy_loc = sum(y for _, y in pos_xy_local) / n_loc
+        m2_loc = sum((y - cy_loc) ** 2 for _, y in pos_xy_local) / n_loc
+
         imgs.append((origin_local[0], grid_local, img, z0, w1_map, w2_map,
-                     weight_grid, len(data_local)))
+                     weight_grid, len(data_local), cy_loc, m2_loc))
 
     def _merge_pair(img1, img2, is_final_merge):
         # Pulse-count-weighted origin so the running frame tracks the true phase
@@ -1078,6 +1088,14 @@ def _ffbp_impl(
         else:
             new_origin = (n1 * img1[0] + n2 * img2[0]) / nsum
         new_z = (n1 * img1[3] + n2 * img2[3]) / nsum
+        # Combined pulse centroid / along-track variance (parallel axis
+        # theorem); the children's own variances feed this merge's spectral
+        # shift compensation.
+        cy1, m2c1 = img1[8], img1[9]
+        cy2, m2c2 = img2[8], img2[9]
+        cy_new = (n1 * cy1 + n2 * cy2) / nsum
+        m2_new = (n1 * (m2c1 + (cy1 - cy_new) ** 2)
+                  + n2 * (m2c2 + (cy2 - cy_new) ** 2)) / nsum
         alias = False
         # output_alias only applies to final merge
         out_alias = output_alias
@@ -1159,6 +1177,8 @@ def _ffbp_impl(
                 output_weight_map=True,
                 output_weight_decimation=out_dec,
                 dem=dem_merge,
+                m2_0=m2c1,
+                m2_1=m2c2,
             )
         else:
             # Standard merge (no antenna pattern)
@@ -1177,14 +1197,16 @@ def _ffbp_impl(
                 output_alias=out_alias,
                 use_poly=use_poly,
                 poly_coefs=poly_coefs,
-                dem=dem_merge
+                dem=dem_merge,
+                m2_0=m2c1,
+                m2_1=m2c2,
             )
             w1_out = None
             w2_out = None
             merged_weight_grid = None
 
         return (new_origin, grid_polar_new, img_sum, new_z, w1_out, w2_out,
-                merged_weight_grid, nsum)
+                merged_weight_grid, nsum, cy_new, m2_new)
 
     # Balanced reduction: each pass merges adjacent pairs and carries a trailing
     # odd image to the next pass. Adjacency keeps every intermediate

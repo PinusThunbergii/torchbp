@@ -490,5 +490,38 @@ static T knab_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, int 
     return sum;
 }
 
+// knab_interp_2d_cpu with the x-axis (range) taps demodulated by ``fmod_x``
+// (radians per x-sample): interpolates s(n)*exp(-j*fmod_x*(n - x)), which
+// reconstructs s(x) exactly when the signal's local spectrum is centered at
+// fmod_x instead of DC. Mirrors knab_interp_2d_fmod in cuda/util.h.
+template<class T>
+static T knab_interp_2d_fmod_cpu(const T *img, int nx, int ny, float x, float y,
+                                 int order, float v, float norm, float fmod_x) {
+    if (fmod_x == 0.0f) {
+        return knab_interp_2d_cpu<T>(img, nx, ny, x, y, order, v, norm);
+    }
+    float a = 0.5f * order;
+    int start_x = std::max(0, (int)ceilf(x - a));
+    int end_x = std::min(nx-1, (int)floorf(x + a));
+    int start_y = std::max(0, (int)ceilf(y - a));
+    int end_y = std::min(ny-1, (int)floorf(y + a));
+    int ny_count = std::min(end_y - start_y + 1, INTERP_MAX_TAPS);
+    float wy[INTERP_MAX_TAPS];
+    for (int j = 0; j < ny_count; j++) {
+        wy[j] = knab_kernel_cpu(y - (start_y + j), a, v, norm);
+    }
+    T rot(cosf(-fmod_x * (start_x - x)), sinf(-fmod_x * (start_x - x)));
+    const T step(cosf(-fmod_x), sinf(-fmod_x));
+    T sum{};
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - i;
+        float wx = knab_kernel_cpu(dx, a, v, norm);
+        T row_val = interp_row_cpu<T>(img + i * ny + start_y, wy, ny_count);
+        sum += row_val * rot * wx;
+        rot = rot * step;
+    }
+    return sum;
+}
+
 }
 #endif

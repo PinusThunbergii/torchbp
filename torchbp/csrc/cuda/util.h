@@ -310,6 +310,38 @@ __device__ T knab_interp_2d(const T2 *img, int nx, int ny, float x, float y, int
     return sum;
 }
 
+// 2D Knab interpolation with the x-axis (range) taps demodulated by the
+// known local frequency ``fmod_x`` (radians per x-sample): interpolates
+// s(n)*exp(-j*fmod_x*(n - x)), which reconstructs s(x) exactly when the
+// signal's local spectrum is centered at fmod_x instead of DC. Used by the
+// ffbp merges where the subaperture image's range spectrum is shifted by
+// the aperture-averaged cos(aspect) projection at close range.
+template<class T, class T2>
+__device__ T knab_interp_2d_fmod(const T2 *img, int nx, int ny, float x, float y,
+                                 int order, float v, float norm, float fmod_x) {
+    if (fmod_x == 0.0f) {
+        return knab_interp_2d<T, T2>(img, nx, ny, x, y, order, v, norm);
+    }
+    float a = 0.5f * order;
+    int start_x = max(0, (int)ceilf(x - a));
+    int end_x = min(nx-1, (int)floorf(x + a));
+    float rs, rc;
+    __sincosf(-fmod_x * (start_x - x), &rs, &rc);
+    float ds, dc;
+    __sincosf(-fmod_x, &ds, &dc);
+    T rot = {rc, rs};
+    const T step = {dc, ds};
+    T sum{};
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - i;
+        float wx = knab_kernel(dx, a, v, norm);
+        T row_val = knab_interp_1d<T, T2>(img + i * ny, ny, y, order, v, norm);
+        sum += (wx * rot) * row_val;
+        rot = rot * step;
+    }
+    return sum;
+}
+
 // 1D windowed-sinc resampler tap. Reads the input signal at continuous
 // position ``src`` (in input samples) with a Lanczos kernel. ``cutoff`` <= 1
 // lowpasses to ``cutoff`` * input-Nyquist for anti-aliased decimation; it is 1
@@ -420,6 +452,71 @@ __device__ T interp_2d_poly(const T2 *img, int nx, int ny, float x, float y, int
             }
             sum += (wx * wy[j]) * val;
         }
+    }
+    return sum;
+}
+
+// interp_2d_poly with the x-axis (range) taps demodulated by ``fmod_x``
+// (radians per x-sample); see knab_interp_2d_fmod.
+template<class T, class T2, int N_COEFS, int MAX_ORDER=8>
+__device__ T interp_2d_poly_fmod(const T2 *img, int nx, int ny, float x, float y,
+                                 int order, float fmod_x) {
+    if (fmod_x == 0.0f) {
+        return interp_2d_poly<T, T2, N_COEFS, MAX_ORDER>(img, nx, ny, x, y, order);
+    }
+    float a = 0.5f * order;
+    float inv_a2 = 1 / (a * a);
+
+    int start_x = max(0, (int)ceilf(x - a));
+    int end_x = min(nx-1, (int)floorf(x + a));
+    int start_y = max(0, (int)ceilf(y - a));
+    int end_y = min(ny-1, (int)floorf(y + a));
+
+    int nx_count = end_x - start_x + 1;
+    int ny_count = end_y - start_y + 1;
+
+    float wy[MAX_ORDER];
+
+    #pragma unroll
+    for (int j = 0; j < MAX_ORDER; j++) {
+        if (j < ny_count) {
+            float dy = y - (float)(start_y + j);
+            wy[j] = poly_interp_kernel<N_COEFS>(dy, inv_a2);
+        }
+    }
+
+    float rs, rc;
+    __sincosf(-fmod_x * (start_x - x), &rs, &rc);
+    float ds, dc;
+    __sincosf(-fmod_x, &ds, &dc);
+    T rot = {rc, rs};
+    const T step = {dc, ds};
+
+    T sum{};
+    #pragma unroll
+    for (int i = 0; i < MAX_ORDER; i++) {
+        if (i >= nx_count) break;
+
+        float dx = x - (float)(start_x + i);
+        float wx = poly_interp_kernel<N_COEFS>(dx, inv_a2);
+
+        const T2 *row = img + (start_x + i) * ny;
+
+        T row_sum{};
+        #pragma unroll
+        for (int j = 0; j < MAX_ORDER; j++) {
+            if (j >= ny_count) break;
+            T val;
+            if constexpr (::cuda::std::is_same_v<T2, complex32_t> || ::cuda::std::is_same_v<T2, half2>) {
+                half2 val_h = ((half2*)row)[start_y + j];
+                val = {__half2float(val_h.x), __half2float(val_h.y)};
+            } else {
+                val = row[start_y + j];
+            }
+            row_sum += wy[j] * val;
+        }
+        sum += (wx * rot) * row_sum;
+        rot = rot * step;
     }
     return sum;
 }

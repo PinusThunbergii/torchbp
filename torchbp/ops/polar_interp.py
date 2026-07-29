@@ -586,7 +586,9 @@ def ffbp_merge2_knab(
     alias: bool = False,
     alias_fmod: float = 0,
     output_alias: bool = True,
-    dem: Tensor | None = None
+    dem: Tensor | None = None,
+    m2_0: float = 0.0,
+    m2_1: float = 0.0,
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -687,6 +689,8 @@ def ffbp_merge2_knab(
         alias_mode,
         alias_fmod,
         dem,
+        m2_0,
+        m2_1,
     )
 
 
@@ -706,7 +710,9 @@ def ffbp_merge2_poly(
     output_alias: bool = True,
     poly_degree: int = None,
     poly_coefs: Tensor = None,
-    dem: Tensor | None = None
+    dem: Tensor | None = None,
+    m2_0: float = 0.0,
+    m2_1: float = 0.0,
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -832,6 +838,8 @@ def ffbp_merge2_poly(
         alias_mode,
         alias_fmod,
         dem,
+        m2_0,
+        m2_1,
     )
 
 
@@ -859,6 +867,8 @@ def ffbp_merge2_poly_weighted(
     output_weight_map: bool = False,
     output_weight_decimation: int = 1,
     dem: Tensor | None = None,
+    m2_0: float = 0.0,
+    m2_1: float = 0.0,
 ) -> tuple[Tensor, Tensor | None, Tensor | None, "dict | None"]:
     """
     Interpolate two pseudo-polar radar images to new grid with antenna pattern weighting.
@@ -1017,6 +1027,8 @@ def ffbp_merge2_poly_weighted(
         1 if output_weight_map else 0,
         output_weight_decimation,
         dem,
+        m2_0,
+        m2_1,
     )
 
     if output_weight_map:
@@ -1051,7 +1063,9 @@ def ffbp_merge2(
     output_alias: bool = True,
     use_poly: bool = True,
     poly_coefs: Tensor = None,
-    dem: Tensor | None = None
+    dem: Tensor | None = None,
+    m2_0: float = 0.0,
+    m2_1: float = 0.0,
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -1116,7 +1130,9 @@ def ffbp_merge2(
         oversample=oversample,
         alias=alias,
         alias_fmod=alias_fmod,
-        output_alias=output_alias
+        output_alias=output_alias,
+        m2_0=m2_0,
+        m2_1=m2_1,
     )
     if use_poly and poly_coefs is not None:
         kwargs['poly_coefs'] = poly_coefs

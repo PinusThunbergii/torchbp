@@ -1344,16 +1344,63 @@ static void apply_merge_alias(float *accr, float *acci, int nchunk, int alias,
     }
 }
 
+// Local range-frequency (radians per range sample) of a subaperture image's
+// content at a merge lookup; see ffbp_merge2_range_fmod in
+// cuda/polar_interp.cu. m2 is the variance of the subaperture's along-track
+// pulse positions about its origin (meters^2).
+static inline float ffbp_merge2_range_fmod_cpu(float m2, float rp, float tp,
+        float rpz, float ref_phase, float dr_c) {
+    if (m2 == 0.0f) {
+        return 0.0f;
+    }
+    const float rpz2 = rpz * rpz;
+    const float fpp = -(rp / (rpz2 * rpz)) *
+        (1.0f + tp * tp * (2.0f - 3.0f * rp * rp / rpz2));
+    return kPI * ref_phase * 0.5f * m2 * fpp * dr_c;
+}
+
+// ffbp_merge2_table_taps_cpu with the range taps demodulated by ``fmod_x``
+// (radians per range sample); ``frac_x`` is the lookup's fractional offset
+// from the window start (dri - su). Scalar path used only where the
+// compensation is active (close-range lookups); the weights are the same
+// polyphase table rows as the fast path.
+template<int TAPS>
+static inline complex64_t ffbp_merge2_table_taps_fmod_cpu(const complex64_t *img,
+        int Nr, int Ntheta, int su, int sv, const float *wr, const float *wt,
+        float fmod_x, float frac_x) {
+    complex64_t rot(cosf(fmod_x * frac_x), sinf(fmod_x * frac_x));
+    const complex64_t step(cosf(-fmod_x), sinf(-fmod_x));
+    complex64_t sum{};
+    const int j0 = std::max(0, -sv), j1 = std::min(TAPS, Ntheta - sv);
+    for (int i = 0; i < TAPS; i++) {
+        const int u = su + i;
+        if (u >= 0 && u < Nr) {
+            const float *row = (const float*)(img + (size_t)u * Ntheta + sv);
+            float rr = 0.0f, ri = 0.0f;
+            for (int j = j0; j < j1; j++) {
+                rr += row[2*j] * wt[j];
+                ri += row[2*j+1] * wt[j];
+            }
+            sum += complex64_t(rr, ri) * rot * wr[i];
+        }
+        rot = rot * step;
+    }
+    return sum;
+}
+
 // Shared body of the lanczos and knab merge kernels. They differ only in the
 // interpolator, so it is passed as a template functor
-// (img, nr, ntheta, x, y) -> complex64_t: it inlines fully, leaving no
-// indirect call or extra branch in the gather loop.
+// (img, nr, ntheta, x, y, nu) -> complex64_t: it inlines fully, leaving no
+// indirect call or extra branch in the gather loop. ``nu`` is the local
+// range-frequency demodulation (0 disables).
+
 template<typename Interp>
 static void ffbp_merge2_kernel_cpu(const complex64_t *img0, const complex64_t *img1,
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int alias, float alias_fmod,
+        float dtheta1, int Nr1, int Ntheta1, float z1, float m2_0, float m2_1,
+        int alias, float alias_fmod,
         const float *dem, float dem_r_scale, float dem_theta_scale,
         int dem_nr, int dem_ntheta, int idr, int tb, Interp interp_2d) {
     float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
@@ -1393,12 +1440,22 @@ static void ffbp_merge2_kernel_cpu(const complex64_t *img0, const complex64_t *i
                     dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
         }
         // Scalar pass: data-dependent interpolation gather.
+        const float m2c = id == 0 ? m2_0 : m2_1;
+        const float z0c = z1 + dorigin[id * 3 + 2];
         for (int q = 0; q < nchunk; q++) {
             const float dri = dri_buf[q];
             if (dri < 0.0f) {
                 continue;
             }
-            complex64_t v = interp_2d(img, Nr[id], Ntheta[id], dri, dti_buf[q]);
+            float nu = 0.0f;
+            if (m2c != 0.0f) {
+                const float rp = rp_buf[q];
+                const float z0q = has_dem ? z0c - zp_buf[q] : z0c;
+                const float rpz = sqrtf(z0q*z0q + rp*rp);
+                nu = ffbp_merge2_range_fmod_cpu(m2c, rp, tp_buf[q], rpz,
+                        ref_phase, dr[id]);
+            }
+            complex64_t v = interp_2d(img, Nr[id], Ntheta[id], dri, dti_buf[q], nu);
             accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
@@ -1421,9 +1478,11 @@ static void ffbp_merge2_kernel_lanczos_cpu(const complex64_t *img0, const comple
         int dem_nr, int dem_ntheta, int idr, int tb) {
     ffbp_merge2_kernel_cpu(img0, img1, out, dorigin, ref_phase, r0, dr, theta0,
             dtheta, Nr, Ntheta, r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1,
+            0.0f, 0.0f,
             alias, alias_fmod, dem, dem_r_scale, dem_theta_scale, dem_nr,
             dem_ntheta, idr, tb,
-            [order](const complex64_t *img, int nr, int nt, float x, float y) {
+            [order](const complex64_t *img, int nr, int nt, float x, float y,
+                    float) {
                 return lanczos_interp_2d_cpu<complex64_t>(img, nr, nt, x, y, order);
             });
 }
@@ -1432,18 +1491,20 @@ static void ffbp_merge2_kernel_knab_cpu(const complex64_t *img0, const complex64
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, int alias,
+        float dtheta1, int Nr1, int Ntheta1, float z1, float m2_0, float m2_1,
+        int order, float knab_v, int alias,
         float alias_fmod, const float *dem, float dem_r_scale,
         float dem_theta_scale, int dem_nr, int dem_ntheta, int idr, int tb) {
     const float knab_norm = knab_kernel_norm_cpu(order, knab_v);
     ffbp_merge2_kernel_cpu(img0, img1, out, dorigin, ref_phase, r0, dr, theta0,
             dtheta, Nr, Ntheta, r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1,
+            m2_0, m2_1,
             alias, alias_fmod, dem, dem_r_scale, dem_theta_scale, dem_nr,
             dem_ntheta, idr, tb,
             [order, knab_v, knab_norm](const complex64_t *img, int nr, int nt,
-                                       float x, float y) {
-                return knab_interp_2d_cpu<complex64_t>(img, nr, nt, x, y, order,
-                                                       knab_v, knab_norm);
+                                       float x, float y, float nu) {
+                return knab_interp_2d_fmod_cpu<complex64_t>(img, nr, nt, x, y, order,
+                                                            knab_v, knab_norm, nu);
             });
 }
 
@@ -1452,7 +1513,8 @@ static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, const float *w_table,
+        float dtheta1, int Nr1, int Ntheta1, float z1, float m2_0, float m2_1,
+        const float *w_table,
         int alias, float alias_fmod, const float *dem, float dem_r_scale,
         float dem_theta_scale, int dem_nr, int dem_ntheta, int idr, int tb) {
     float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
@@ -1496,14 +1558,30 @@ static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64
         ffbp_merge2_table_index_pass_cpu<TAPS>(MERGE_INTERP_TABLE_PHASES,
                 nchunk, dri_buf, dti_buf, ir_buf, it_buf, pr_buf, pt_buf);
         // Per-pixel pass: data-dependent interpolation gather.
+        const float m2c = id == 0 ? m2_0 : m2_1;
+        const float z0c = z1 + dorigin[id * 3 + 2];
         for (int q = 0; q < nchunk; q++) {
             if (dri_buf[q] < 0.0f) {
                 continue;
             }
-            complex64_t v = ffbp_merge2_table_taps_cpu<TAPS>(img, Nr[id], Ntheta[id],
-                    ir_buf[q], it_buf[q],
-                    w_table + (size_t)pr_buf[q] * TAPS,
-                    w_table + (size_t)pt_buf[q] * TAPS);
+            float nu = 0.0f;
+            if (m2c != 0.0f) {
+                const float rp = rp_buf[q];
+                const float z0q = has_dem ? z0c - zp_buf[q] : z0c;
+                const float rpz = sqrtf(z0q*z0q + rp*rp);
+                nu = ffbp_merge2_range_fmod_cpu(m2c, rp, tp_buf[q], rpz,
+                        ref_phase, dr[id]);
+            }
+            complex64_t v = nu == 0.0f
+                ? ffbp_merge2_table_taps_cpu<TAPS>(img, Nr[id], Ntheta[id],
+                        ir_buf[q], it_buf[q],
+                        w_table + (size_t)pr_buf[q] * TAPS,
+                        w_table + (size_t)pt_buf[q] * TAPS)
+                : ffbp_merge2_table_taps_fmod_cpu<TAPS>(img, Nr[id], Ntheta[id],
+                        ir_buf[q], it_buf[q],
+                        w_table + (size_t)pr_buf[q] * TAPS,
+                        w_table + (size_t)pt_buf[q] * TAPS,
+                        nu, dri_buf[q] - ir_buf[q]);
             accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
@@ -1624,7 +1702,9 @@ at::Tensor ffbp_merge2_knab_cpu(
           double oversample,
           int64_t alias,
           double alias_fmod,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          double m2_0,
+          double m2_1) {
     TORCH_CHECK(img0.dtype() == at::kComplexFloat);
     TORCH_CHECK(img1.dtype() == at::kComplexFloat);
     TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -1681,7 +1761,8 @@ at::Tensor ffbp_merge2_knab_cpu(
         for (int tc = 0; tc < ntchunks; tc++) {
             ffbp_merge2_kernel_knab_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
                     ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
-                    r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, v, alias, alias_fmod/kPI,
+                    r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1,
+                    (float)m2_0, (float)m2_1, order, v, alias, alias_fmod/kPI,
                     dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta,
                     idr, tc * MERGE_CHUNK);
         }
@@ -1711,7 +1792,9 @@ at::Tensor ffbp_merge2_poly_cpu(
           const at::Tensor &poly_coefs,
           int64_t alias,
           double alias_fmod,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          double m2_0,
+          double m2_1) {
     TORCH_CHECK(img0.dtype() == at::kComplexFloat);
     TORCH_CHECK(img1.dtype() == at::kComplexFloat);
     TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -1794,7 +1877,8 @@ at::Tensor ffbp_merge2_poly_cpu(
             for (int tc = 0; tc < ntchunks; tc++) { \
                 ffbp_merge2_kernel_poly_cpu<T>(img0_ptr, img1_ptr, out_ptr, dorigin_ptr, \
                         ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, w_table_ptr, \
+                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, \
+                        (float)m2_0, (float)m2_1, w_table_ptr, \
                         alias, alias_fmod/kPI, \
                         dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, idr, tc * MERGE_CHUNK); \
             } \
@@ -1820,7 +1904,8 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
         const float *r0, const float *dr, const float *theta0, const float *dtheta,
         const int *Nr, const int *Ntheta,
         float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
-        float z1, const float *w_table, int alias, float alias_fmod,
+        float z1, float m2_0, float m2_1,
+        const float *w_table, int alias, float alias_fmod,
         const float *w1_map0, const float *w2_map0,
         float w_r0_0, float w_dr0, float w_theta0_0, float w_dtheta0,
         int w_nr0, int w_ntheta0,
@@ -1882,14 +1967,30 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
         ffbp_merge2_table_index_pass_cpu<TAPS>(MERGE_INTERP_TABLE_PHASES,
                 nchunk, dri_buf, dti_buf, ir_buf, it_buf, pr_buf, pt_buf);
         // Per-pixel pass: data-dependent interpolation and weight map gathers.
+        const float m2c = id == 0 ? m2_0 : m2_1;
+        const float z0c = z1 + dorigin[id * 3 + 2];
         for (int q = 0; q < nchunk; q++) {
             if (dri_buf[q] < 0.0f) {
                 continue;
             }
-            complex64_t v = ffbp_merge2_table_taps_cpu<TAPS>(img, Nr[id], Ntheta[id],
-                    ir_buf[q], it_buf[q],
-                    w_table + (size_t)pr_buf[q] * TAPS,
-                    w_table + (size_t)pt_buf[q] * TAPS);
+            float nu = 0.0f;
+            if (m2c != 0.0f) {
+                const float rp = rp_buf[q];
+                const float z0q = has_dem ? z0c - zp_buf[q] : z0c;
+                const float rpz = sqrtf(z0q*z0q + rp*rp);
+                nu = ffbp_merge2_range_fmod_cpu(m2c, rp, tp_buf[q], rpz,
+                        ref_phase, dr[id]);
+            }
+            complex64_t v = nu == 0.0f
+                ? ffbp_merge2_table_taps_cpu<TAPS>(img, Nr[id], Ntheta[id],
+                        ir_buf[q], it_buf[q],
+                        w_table + (size_t)pr_buf[q] * TAPS,
+                        w_table + (size_t)pt_buf[q] * TAPS)
+                : ffbp_merge2_table_taps_fmod_cpu<TAPS>(img, Nr[id], Ntheta[id],
+                        ir_buf[q], it_buf[q],
+                        w_table + (size_t)pr_buf[q] * TAPS,
+                        w_table + (size_t)pt_buf[q] * TAPS,
+                        nu, dri_buf[q] - ir_buf[q]);
 
             const float vr = v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             const float vi = v.real() * sn_buf[q] + v.imag() * cs_buf[q];
@@ -1988,7 +2089,9 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
           int64_t w_nr1, int64_t w_ntheta1,
           int64_t output_weight_map,
           int64_t output_weight_decimation,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          double m2_0,
+          double m2_1) {
     TORCH_CHECK(img0.dtype() == at::kComplexFloat);
     TORCH_CHECK(img1.dtype() == at::kComplexFloat);
     TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2113,7 +2216,8 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
                 ffbp_merge2_kernel_poly_weighted_cpu<T>( \
                         img0_ptr, img1_ptr, out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
                         r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, w_table_ptr, \
+                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, \
+                        (float)m2_0, (float)m2_1, w_table_ptr, \
                         alias, alias_fmod/kPI, \
                         w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0, \
                         w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1, \
