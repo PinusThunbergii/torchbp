@@ -2939,6 +2939,9 @@ def insar_rme_multisquint(
     band_spacing: str = "elevation",
     estimate_z: bool = False,
     n_z_basis: int = 8,
+    estimate_y: bool = False,
+    n_az_blocks: int | None = None,
+    n_y_basis: int = 8,
     aperture_mask: bool = True,
     aperture_pad: float = 1.0,
     patch_theta: int | None = None,
@@ -2985,8 +2988,22 @@ def insar_rme_multisquint(
     images must be formed on the same polar grid in the same coordinate
     frame. Constant slant-range error is unobservable (absorbed into the
     baseline estimate); the returned correction is zero-mean per axis.
-    Along-track (Y) error is not estimated; its first-order effect on the
-    look phases averages out over a symmetric azimuth extent.
+
+    Along-track (Y) error is estimated with ``estimate_y=True``. Its phase
+    signature ``k * sin(aspect) * eps_y`` is odd in aspect angle, so it
+    cancels when the double differences are averaged over the full azimuth
+    line; the estimator therefore resolves them in ``n_az_blocks`` theta
+    blocks and solves X/Z/Y jointly from the per-(band, block, pair)
+    observations. Y steps are projected on the odd-in-aspect midpoint
+    look-vector component (parallel to the Z parameterization); the
+    even-in-aspect ``dl_y * eps_y`` pathway is deliberately not used — it
+    is nearly collinear with the X steps and would split X error into Y.
+    Constant and linear-in-track Y components are unobservable (as for
+    X/Z); the returned Y correction is zero-mean. IMPORTANT: scatterers
+    off the backprojection focus surface produce the same odd-in-aspect
+    phase as a Y error, so for ``estimate_y`` the master and slave images
+    should be formed on a DEM (terrain-compensated); on a flat grid over
+    real topography the terrain aliases into the Y estimate.
 
     Parameters
     ----------
@@ -3028,6 +3045,18 @@ def insar_rme_multisquint(
         look phases, which is noisier than their common mode; a coarse
         basis trades Z bandwidth for stability. Z components faster than
         ``n_z_basis / 2`` cycles per aperture are not resolved.
+    estimate_y : bool
+        Also solve for along-track (Y) position error. Requires azimuth
+        (aspect-angle) diversity: the images must cover a usable theta
+        extent and ``n_az_blocks`` must be >= 2. See the note above about
+        forming the images on a DEM.
+    n_az_blocks : int or None
+        Number of azimuth (theta) blocks the double differences are
+        resolved in. None (default) uses 1 block without ``estimate_y``
+        (exactly the azimuth-averaged estimator) and 8 with it.
+    n_y_basis : int
+        Number of linear-interpolation basis knots for the Y error
+        profile, analogous to ``n_z_basis``.
     aperture_mask : bool
         Zero out pixels outside a look's angular aperture (using the grid
         theta extent as the beam proxy) when averaging the double
@@ -3063,11 +3092,15 @@ def insar_rme_multisquint(
         the median double-difference weight. Shrinks the correction
         toward zero where all bands have low SNR (track edges).
     remove_trend : bool
-        Remove the weighted mean phase step per band before solving.
-        This removes linear error trends (unobservable, absorbed into
-        the baseline estimate) together with the deterministic
-        baseline-induced ramp of the look phases, which is
+        Remove the weighted mean phase step per band (and azimuth block)
+        before solving. This removes linear error trends (unobservable,
+        absorbed into the baseline estimate) together with the
+        deterministic baseline-induced ramp of the look phases, which is
         range-dependent and would otherwise leak into a slow X/Z drift.
+        The design columns are projected the same way so the fit happens
+        in the detrended subspace (an unprojected design predicts the
+        removed common mode and the misfit leaks between the correlated
+        X/Y/Z column families).
     altitude : float or None
         Sensor altitude for slant-range grids, see
         :func:`insar_rme_blocksvd_strata`. None infers altitude from
@@ -3093,7 +3126,7 @@ def insar_rme_multisquint(
     -------
     pos_s_new : Tensor [nsweeps, 3]
         Corrected slave positions; X always corrected, Z only when
-        ``estimate_z=True``.
+        ``estimate_z=True``, Y only when ``estimate_y=True``.
     delta : Tensor [nsweeps, 3]
         Total per-sweep XYZ correction added to ``pos_s``. Non-estimated
         axes are zero.
@@ -3126,6 +3159,12 @@ def insar_rme_multisquint(
         raise ValueError(f"n_r_bands ({n_r_bands}) must be >= {n_axes}")
     if max_iters > 1 and (data_s is None or r_res is None):
         raise ValueError("data_s and r_res are required when max_iters > 1")
+    if n_az_blocks is None:
+        T_req = 8 if estimate_y else 1
+    else:
+        T_req = int(n_az_blocks)
+    if estimate_y and T_req < 2:
+        raise ValueError("estimate_y requires n_az_blocks >= 2")
 
     if spatial_coherence is not None:
         sc = (
@@ -3272,8 +3311,13 @@ def insar_rme_multisquint(
         # averaging), diluting every phase step by the shared-energy
         # fraction.
         ndiff = n_looks - lag
+        # Azimuth blocks over the patch columns: the Y signature is odd in
+        # aspect angle and would cancel in a full-line average.
+        T = max(1, min(T_req, npatch))
+        P_blk = npatch // T
+        npatch_used = T * P_blk
         dd_bands = torch.zeros(
-            (n_r_bands, ndiff), dtype=torch.complex64, device=device
+            (n_r_bands, T, ndiff), dtype=torch.complex64, device=device
         )
         P_hist = [None] * n_looks
         for j in range(n_looks):
@@ -3308,13 +3352,14 @@ def insar_rme_multisquint(
                 # needed for sub-pi differences.
                 D = P * torch.conj(P_hist[j - lag])
                 P_hist[j - lag] = None
-                Dr = torch.cumsum(torch.sum(D, dim=1), dim=0)
+                D_blk = D[:, :npatch_used].reshape(nr, T, P_blk).sum(dim=2)
+                Dr = torch.cumsum(D_blk, dim=0)                  # [nr, T]
                 for b in range(n_r_bands):
                     i0, i1 = int(edges[b]), int(edges[b + 1])
                     if i1 <= i0:
                         continue
                     lo = Dr[i0 - 1] if i0 > 0 else 0.0
-                    dd_bands[b, j - lag] = Dr[i1 - 1] - lo
+                    dd_bands[b, :, j - lag] = Dr[i1 - 1] - lo
 
         steps_bands = torch.angle(dd_bands)
         w_steps = dd_bands.abs()
@@ -3332,17 +3377,27 @@ def insar_rme_multisquint(
         if K < n_axes:
             raise ValueError(f"Only {K} valid range bands, need >= {n_axes}")
 
+        # Azimuth-collapsed observations reproduce the non-blocked
+        # estimator; used for the per-band diagnostics profiles.
+        dd_az = dd_bands.sum(dim=1)                              # [nbands, ndiff]
+        steps_az = torch.angle(dd_az)
+        w_az = dd_az.abs()
+
         if remove_trend:
             # A constant step per band is a linear trend in the error
             # profile: unobservable RME (absorbed into the baseline
             # estimate) plus the deterministic baseline-induced phase
             # ramp, which is range-dependent and would otherwise leak
             # into a slow X/Z drift through the LS. Remove the weighted
-            # mean difference per band.
-            wm = torch.sum(w_steps * steps_bands, dim=1, keepdim=True) / (
-                torch.sum(w_steps, dim=1, keepdim=True) + 1e-30
+            # mean difference per band (and per azimuth block).
+            wm = torch.sum(w_steps * steps_bands, dim=-1, keepdim=True) / (
+                torch.sum(w_steps, dim=-1, keepdim=True) + 1e-30
             )
             steps_bands = steps_bands - wm
+            wm_az = torch.sum(w_az * steps_az, dim=-1, keepdim=True) / (
+                torch.sum(w_az, dim=-1, keepdim=True) + 1e-30
+            )
+            steps_az = steps_az - wm_az
 
         # Each lag difference is the sum of `lag` adjacent look steps:
         # S_map [ndiff, npairs] with ones on the lag-wide band.
@@ -3361,7 +3416,7 @@ def insar_rme_multisquint(
             )
             rhs = torch.cat(
                 [
-                    steps_bands.t(),
+                    steps_az.t(),
                     torch.zeros((npairs, n_r_bands), device=device),
                 ],
                 dim=0,
@@ -3389,52 +3444,53 @@ def insar_rme_multisquint(
                     )
 
         # Position error difference over each lag interval, observed in
-        # slant range per band. The double difference phase is
-        # +k * l . (eps_j - eps_(j-lag)) where eps is the slave position
-        # error; the correction is its negation.
-        dr_diffs = -steps_bands[valid_idx] / k                   # [K, ndiff]
+        # slant range per band and azimuth block. The double difference
+        # phase is +k * l . (eps_j - eps_(j-lag)) where eps is the slave
+        # position error; the correction is its negation.
+        dr_diffs = -steps_bands[valid_idx] / k                   # [K, T, ndiff]
 
-        # Look vector from lag-interval midpoint to broadside band
-        # centroid, same conventions as insar_rme_blocksvd_strata
+        # Look vector from the lag-interval midpoint to the band centroid
+        # of each azimuth block, same conventions as
+        # insar_rme_blocksvd_strata. Block-centre theta over the used
+        # patch columns:
+        t_blk = theta0 + dtheta * L_patch * P_blk * (
+            torch.arange(T, device=device, dtype=torch.float32) + 0.5
+        )
         y_mid = 0.5 * (y_looks[lag:] + y_looks[:-lag])           # [ndiff]
         rc_active = band_rc[valid_idx]
         if altitude is not None:
             H = float(altitude)
-            x_ground = torch.sqrt(
-                torch.clamp(rc_active ** 2 - H ** 2, min=1e-6)
-            )
-            dxs = x_ground[None, :].expand(ndiff, -1)            # [ndiff, K]
-            dys = -y_mid[:, None].expand(-1, K)
-            dzs = torch.full_like(dxs, -H)
+            rg0 = torch.sqrt(torch.clamp(rc_active ** 2 - H ** 2, min=1e-6))
+            z_plat = H
+            x_mean = 0.0
         else:
-            dxs = (rc_active[None, :] - float(pos_s[:, 0].mean())).expand(
-                ndiff, -1
-            )
-            dys = -y_mid[:, None].expand(-1, K)
-            dzs = torch.full_like(dxs, -float(pos_s[:, 2].mean()))
-        rg = torch.sqrt(dxs ** 2 + dys ** 2)
-        rs = torch.sqrt(rg ** 2 + dzs ** 2) + 1e-9
-        cos_el_m = rg / rs
-        sin_el_m = dzs / rs
-        cos_az_m = dxs / (rg + 1e-9)
-
-        m_x = (cos_az_m * cos_el_m).t()                          # [K, ndiff]
-        m_z = sin_el_m.t()
+            rg0 = rc_active
+            z_plat = float(pos_s[:, 2].mean())
+            x_mean = float(pos_s[:, 0].mean())
+        cos_t_blk = torch.sqrt(torch.clamp(1.0 - t_blk ** 2, min=0.0))
+        px = rg0[:, None] * cos_t_blk[None, :]                   # [K, T]
+        py = rg0[:, None] * t_blk[None, :]
+        dxs = (px - x_mean)[:, :, None]                          # [K, T, 1]
+        dys = py[:, :, None] - y_mid[None, None, :]              # [K, T, ndiff]
+        rs = torch.sqrt(dxs ** 2 + dys ** 2 + z_plat ** 2) + 1e-9
+        m_x = dxs / rs                                           # [K, T, ndiff]
+        m_z = -z_plat / rs
 
         # Global weight normalization keeps the per-difference absolute
         # SNR information so the ridge term can shrink low-SNR
         # observations (track edges) toward zero instead of amplifying
         # noise through the LS inverse.
-        W_ls = w_steps[valid_idx]                                # [K, ndiff]
+        W_ls = w_steps[valid_idx]                                # [K, T, ndiff]
         W_ls = W_ls / (W_ls.median() + 1e-30)
         sqrtW = W_ls.sqrt()
 
-        # Joint LS over all (band, difference) observations: X error
-        # step per adjacent look pair, Z error steps on a coarse linear
-        # basis. Z observability comes only from the band-differential
-        # of the observations, which is much noisier than their common
-        # mode, so Z gets fewer degrees of freedom than X.
-        nobs = K * ndiff
+        # Joint LS over all (band, block, difference) observations: X
+        # error step per adjacent look pair, Z error steps and Y error
+        # values on coarse linear bases. Z observability comes only from
+        # the band-differential and Y only from the azimuth-block
+        # differential of the observations, both much noisier than the
+        # common mode, so they get fewer degrees of freedom than X.
+        nobs = K * T * ndiff
         if estimate_z:
             nz = int(max(2, min(n_z_basis, npairs)))
             knots = torch.linspace(0, npairs - 1, nz, device=device)
@@ -3446,19 +3502,72 @@ def insar_rme_multisquint(
             SB_z = S_map @ B_z                                   # [ndiff, nz]
         else:
             nz = 0
-        nunk = npairs + nz
+        if estimate_y:
+            # Y error steps on a coarse basis, projected on the
+            # odd-in-aspect midpoint look-vector component m_y =
+            # sin(aspect), exactly parallel to the Z parameterization.
+            # The look-to-look change of l_y also carries a dl_y * eps_y
+            # term, but its aspect signature is even (like X) and nearly
+            # collinear with the X steps, so using it would split X
+            # error into Y; only the odd l_y * d(eps_y) part separates
+            # cleanly.
+            ny = int(max(2, min(n_y_basis, npairs)))
+            knots_y = torch.linspace(0, npairs - 1, ny, device=device)
+            jly = torch.arange(npairs, device=device, dtype=torch.float32)
+            dky = float(knots_y[1] - knots_y[0])
+            B_y = (1.0 - (jly[:, None] - knots_y[None, :]).abs() / dky).clamp(
+                min=0.0
+            )                                                    # [npairs, ny]
+            SB_y = S_map @ B_y                                   # [ndiff, ny]
+            m_y = dys / rs                                       # [K, T, ndiff]
+        else:
+            ny = 0
+        nunk = npairs + nz + ny
 
-        A_blocks = []
-        for kb in range(K):
-            wb = sqrtW[kb][:, None]                              # [ndiff, 1]
-            A_x = S_map * (m_x[kb][:, None] * wb)                # [ndiff, npairs]
+        A_x_full = S_map[None, None, :, :] * m_x[..., None]      # [K, T, ndiff, npairs]
+        A_z_full = (
+            SB_z[None, None, :, :] * m_z[..., None] if estimate_z else None
+        )
+        A_y_full = (
+            SB_y[None, None, :, :] * m_y[..., None] if estimate_y else None
+        )
+        if remove_trend:
+            # The observations had their weighted mean over the
+            # differences removed per (band, block); project the design
+            # columns the same way so the fit happens in the same
+            # detrended subspace. An unprojected design predicts the
+            # removed common mode, and the resulting misfit leaks
+            # between the correlated X/Y/Z column families.
+            w_v = w_steps[valid_idx]
+            wsum_v = torch.sum(w_v, dim=-1, keepdim=True) + 1e-30
+
+            def _detrend_cols(Ac):
+                return Ac - torch.sum(
+                    w_v[..., None] * Ac, dim=2, keepdim=True
+                ) / wsum_v[..., None]
+
+            A_x_full = _detrend_cols(A_x_full)
             if estimate_z:
-                A_zb = SB_z * (m_z[kb][:, None] * wb)            # [ndiff, nz]
-                A_blocks.append(torch.cat([A_x, A_zb], dim=1))
-            else:
-                A_blocks.append(A_x)
+                A_z_full = _detrend_cols(A_z_full)
+            if estimate_y:
+                A_y_full = _detrend_cols(A_y_full)
+        cols = [(A_x_full * sqrtW[..., None]).reshape(nobs, npairs)]
+        if estimate_z:
+            cols.append((A_z_full * sqrtW[..., None]).reshape(nobs, nz))
+        if estimate_y:
+            cols.append((A_y_full * sqrtW[..., None]).reshape(nobs, ny))
+        # The Y columns are weaker than X by the sin(aspect) projection, so
+        # a uniform ridge shrinks Y harder than X (bias), while fully
+        # equalizing the relative shrinkage lets the Y noise through
+        # (the weak columns are weak against noise too). Split the
+        # difference geometrically.
+        reg_diag = torch.full((nunk,), ls_reg, device=device)
+        if estimate_y:
+            rms_x = cols[0].pow(2).mean().sqrt() + 1e-30
+            rms_y = cols[-1].pow(2).mean().sqrt()
+            reg_diag[npairs + nz:] = ls_reg * torch.sqrt(rms_y / rms_x)
         A = torch.cat(
-            A_blocks + [ls_reg * torch.eye(nunk, device=device)], dim=0
+            [torch.cat(cols, dim=1), torch.diag(reg_diag)], dim=0
         )
         yv = torch.cat(
             [
@@ -3469,30 +3578,35 @@ def insar_rme_multisquint(
         sol = torch.linalg.lstsq(A, yv).solution.squeeze(-1)
 
         steps_x = sol[:npairs]
-        steps_z = B_z @ sol[npairs:] if estimate_z else None
+        steps_z = B_z @ sol[npairs:npairs + nz] if estimate_z else None
+        steps_y = B_y @ sol[npairs + nz:] if estimate_y else None
 
         # Integrate the solved steps to the error profile at look centers
         # and interpolate to sweeps
-        sol_steps = [steps_x]
+        steps_axes = [steps_x]
+        axis_map = [0]
         if estimate_z:
-            sol_steps.append(steps_z)
-        sol_steps = torch.stack(sol_steps, dim=-1)               # [npairs, n_axes]
+            steps_axes.append(steps_z)
+            axis_map.append(2)
+        if estimate_y:
+            steps_axes.append(steps_y)
+            axis_map.append(1)
+        sol_steps = torch.stack(steps_axes, dim=-1)              # [npairs, naxes]
         prof = torch.cat(
             [
-                torch.zeros((1, n_axes), device=device),
+                torch.zeros((1, len(axis_map)), device=device),
                 torch.cumsum(sol_steps, dim=0),
             ],
             dim=0,
-        )                                                        # [n_looks, n_axes]
+        )                                                        # [n_looks, naxes]
         y_s = pos_s[:, 1].to(torch.float32)
-        delta_swp = _interp1_linear(y_s, y_looks, prof.t())      # [n_axes, nsweeps]
+        delta_swp = _interp1_linear(y_s, y_looks, prof.t())      # [naxes, nsweeps]
 
         delta_it = torch.zeros(
             (nsweeps, 3), dtype=torch.float32, device=device
         )
-        delta_it[:, 0] = delta_swp[0]
-        if estimate_z:
-            delta_it[:, 2] = delta_swp[1]
+        for ax_i, ax in enumerate(axis_map):
+            delta_it[:, ax] = delta_swp[ax_i]
         delta_it = delta_it - delta_it.mean(dim=0, keepdim=True)
 
         if delta_lowpass and delta_lowpass > 1:
@@ -3525,6 +3639,10 @@ def insar_rme_multisquint(
             rms = [
                 f"X={torch.sqrt(torch.mean(delta_it[:, 0] ** 2)).item() * 1000:.2f}"
             ]
+            if estimate_y:
+                rms.append(
+                    f"Y={torch.sqrt(torch.mean(delta_it[:, 1] ** 2)).item() * 1000:.2f}"
+                )
             if estimate_z:
                 rms.append(
                     f"Z={torch.sqrt(torch.mean(delta_it[:, 2] ** 2)).item() * 1000:.2f}"

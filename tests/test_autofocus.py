@@ -124,6 +124,150 @@ class TestInsarRmeBlocksvd(TestCase):
         )
 
 
+class TestInsarRmeMultisquint(TestCase):
+    """Multisquint InSAR RME: X and along-track (Y) recovery on synthetic
+    point-scatterer data.
+
+    ntheta is chosen so the theta-spectrum Nyquist covers the look bands
+    (f = (2/wl)*cos(el)*y up to y = 2 m); the theta extent gives the
+    aspect-angle diversity the Y estimate needs.
+    """
+
+    fc = 6e9
+    r_res = 0.3
+    grid_polar = {"r": (80.0, 120.0), "theta": (-0.25, 0.25), "nr": 64,
+                  "ntheta": 128}
+    nsweeps = 64
+    sweep_samples = 512
+
+    def _make_data(self, targets, amps, pos):
+        """Point responses consistent with the backprojection phase model."""
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64
+        )
+        m_idx = torch.arange(pos.shape[0])
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        return data
+
+    def _scene(self):
+        torch.manual_seed(7)
+        ntargets = 60
+        r = 85.0 + 30.0 * torch.rand(ntargets)
+        t = -0.22 + 0.44 * torch.rand(ntargets)
+        targets = torch.stack(
+            [r * torch.sqrt(1 - t**2), r * t, torch.zeros_like(r)], dim=1
+        )
+        amps = (1.0 + torch.rand(ntargets)).to(torch.complex64)
+        pos = torch.zeros(self.nsweeps, 3)
+        pos[:, 1] = torch.linspace(-2.0, 2.0, self.nsweeps)
+        pos[:, 2] = 30.0
+        return targets, amps, pos
+
+    def _master(self, targets, amps, pos):
+        data_m = self._make_data(targets, amps, pos)
+        return torchbp.ops.backprojection_polar_2d(
+            data_m, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+
+    def test_recovers_xy_error(self):
+        from torchbp.util import detrend
+        targets, amps, pos = self._scene()
+        img_m = self._master(targets, amps, pos)
+
+        # Slave measured with smooth zero-mean X and Y errors (integer
+        # cycles per aperture; constant/linear parts are unobservable)
+        # but backprojected at the nominal positions.
+        n = torch.arange(self.nsweeps)
+        dx = 2e-3 * torch.sin(2 * torch.pi * 3 * n / self.nsweeps)
+        dy = 8e-3 * torch.sin(2 * torch.pi * 2 * n / self.nsweeps + 0.7)
+        pos_err = pos.clone()
+        pos_err[:, 0] += dx
+        pos_err[:, 1] += dy
+        data_s = self._make_data(targets, amps, pos_err)
+        img_s = torchbp.ops.backprojection_polar_2d(
+            data_s, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+
+        pos_new, delta = torchbp.autofocus.insar_rme_multisquint(
+            img_m, img_s, pos, self.fc, self.grid_polar,
+            n_looks=16, estimate_y=True,
+        )
+        self.assertTrue(torch.isfinite(delta).all())
+        # X must stay accurate with the Y error present and vice versa
+        # (cross-leakage shows up as a residual the size of the other
+        # axis's error). Y is the noisier observable (sin(aspect)
+        # projection); allow it a looser bound.
+        for ax, err, lim in ((0, dx, 0.5), (1, dy, 0.7)):
+            resid = detrend(err - delta[:, ax])
+            self.assertLess(
+                resid.pow(2).mean().sqrt().item(),
+                lim * err.pow(2).mean().sqrt().item(),
+                msg=f"axis {ax}",
+            )
+
+    def test_x_only_default_leaves_y_zero(self):
+        from torchbp.util import detrend
+        targets, amps, pos = self._scene()
+        img_m = self._master(targets, amps, pos)
+
+        n = torch.arange(self.nsweeps)
+        dx = 2e-3 * torch.sin(2 * torch.pi * 3 * n / self.nsweeps)
+        pos_err = pos.clone()
+        pos_err[:, 0] += dx
+        data_s = self._make_data(targets, amps, pos_err)
+        img_s = torchbp.ops.backprojection_polar_2d(
+            data_s, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+
+        pos_new, delta = torchbp.autofocus.insar_rme_multisquint(
+            img_m, img_s, pos, self.fc, self.grid_polar, n_looks=16,
+        )
+        self.assertEqual(delta[:, 1].abs().max().item(), 0.0)
+        resid = detrend(dx - delta[:, 0])
+        self.assertLess(
+            resid.pow(2).mean().sqrt().item(),
+            0.5 * dx.pow(2).mean().sqrt().item(),
+        )
+
+    def test_y_only_recovery(self):
+        # A pure Y error must not leak into X.
+        from torchbp.util import detrend
+        targets, amps, pos = self._scene()
+        img_m = self._master(targets, amps, pos)
+
+        n = torch.arange(self.nsweeps)
+        dy = 8e-3 * torch.sin(2 * torch.pi * 2 * n / self.nsweeps + 0.7)
+        pos_err = pos.clone()
+        pos_err[:, 1] += dy
+        data_s = self._make_data(targets, amps, pos_err)
+        img_s = torchbp.ops.backprojection_polar_2d(
+            data_s, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+
+        pos_new, delta = torchbp.autofocus.insar_rme_multisquint(
+            img_m, img_s, pos, self.fc, self.grid_polar,
+            n_looks=16, estimate_y=True,
+        )
+        resid = detrend(dy - delta[:, 1])
+        self.assertLess(
+            resid.pow(2).mean().sqrt().item(),
+            0.7 * dy.pow(2).mean().sqrt().item(),
+        )
+        self.assertLess(
+            delta[:, 0].pow(2).mean().sqrt().item(),
+            0.5 * dy.pow(2).mean().sqrt().item(),
+        )
+
+
 class TestPga(TestCase):
     """Plain phase gradient autofocus on a synthetic point-target image."""
 
@@ -926,6 +1070,11 @@ class _OnCuda:
 
 @requires_cuda
 class TestInsarRmeBlocksvdCuda(_OnCuda, TestInsarRmeBlocksvd):
+    pass
+
+
+@requires_cuda
+class TestInsarRmeMultisquintCuda(_OnCuda, TestInsarRmeMultisquint):
     pass
 
 
