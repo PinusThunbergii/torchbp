@@ -1155,3 +1155,98 @@ class TestFFBPTxPowerCuda(TestFFBPTxPower):
 @requires_cuda
 class TestFFBPLongBaselineCuda(TestFFBPLongBaseline):
     device = "cuda"
+
+
+class TestFfbpNearField(TestCase):
+    """Near-field handling: grids whose minimum range is comparable to the
+    subaperture length. The top merges' child images then carry an
+    aperture-induced range-spectrum spread beyond the interpolation margin;
+    the nearfield path re-assembles the affected rows from small-aperture
+    children and must match direct backprojection. Far rows must stay as
+    accurate as with nearfield off (the tree is restructured when the
+    criterion fires, so they are equivalent, not bitwise identical).
+    """
+    device = "cpu"
+
+    fc = 6e9
+    r_res = 0.3
+    grid = {"r": (8.0, 40.0), "theta": (-0.5, 0.5), "nr": 160, "ntheta": 900}
+    nsweeps = 640
+    sweep_samples = 512
+    z0 = 5.0
+
+    def _make_data(self, targets, amps, pos):
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64,
+            device=pos.device)
+        m_idx = torch.arange(pos.shape[0], device=pos.device)
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        return data
+
+    def _scene(self, device):
+        torch.manual_seed(3)
+        ntargets = 40
+        r = 9.0 + 28.0 * torch.rand(ntargets, device=device)
+        t = -0.45 + 0.9 * torch.rand(ntargets, device=device)
+        targets = torch.stack(
+            [r * torch.sqrt(1 - t**2), r * t, torch.zeros_like(r)], dim=1)
+        amps = (1.0 + torch.rand(ntargets, device=device)).to(torch.complex64)
+        pos = torch.zeros(self.nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-8.0, 8.0, self.nsweeps, device=device)
+        pos[:, 2] = self.z0
+        return self._make_data(targets, amps, pos), pos
+
+    @staticmethod
+    def _row_coherence(a, b, i0, i1):
+        e = a[i0:i1] * torch.conj(b[i0:i1])
+        return (torch.abs(e.sum()) / (torch.abs(e).sum() + 1e-30)).item()
+
+    def _run(self, device):
+        data, pos = self._scene(device)
+        # guard_max_ratio raised: this compact grid's default guard cap
+        # binds (the near-field lookups need wide theta guards), which
+        # would clip the assembly at the theta edges.
+        common = dict(d0=0.0, dealias=True, oversample_r=1.5,
+                      oversample_theta=1.5, interp_method=("knab", 6, 1.5),
+                      guard_max_ratio=0.5)
+        exact = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, self.r_res, pos, 0.0,
+            dealias=True).squeeze()
+        img_off = torchbp.ops.ffbp(
+            data, self.grid, self.fc, self.r_res, pos, stages=3,
+            nearfield=False, **common)
+        img_on = torchbp.ops.ffbp(
+            data, self.grid, self.fc, self.r_res, pos, stages=3,
+            nearfield=True, **common)
+
+        # Near rows (r 8-16, first quarter): with nearfield the rows must
+        # match direct backprojection; without it they are visibly degraded
+        # (this is the regression the near-field criterion guards).
+        n_near = self.grid["nr"] // 4
+        coh_on = self._row_coherence(img_on, exact, 0, n_near)
+        coh_off = self._row_coherence(img_off, exact, 0, n_near)
+        self.assertGreater(coh_on, 0.97)
+        self.assertGreater(coh_on, coh_off + 0.02)
+
+        # Far rows: the restructured tree must stay as accurate as the
+        # normal one.
+        n_far = self.grid["nr"] // 2
+        far_on = self._row_coherence(img_on, exact, n_far, self.grid["nr"])
+        far_off = self._row_coherence(img_off, exact, n_far, self.grid["nr"])
+        self.assertGreater(far_on, far_off - 0.005)
+
+    def test_nearfield_cpu(self):
+        self._run(self.device)
+
+    @requires_cuda
+    def test_nearfield_cuda(self):
+        self._run("cuda")

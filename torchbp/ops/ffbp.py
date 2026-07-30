@@ -237,6 +237,7 @@ def ffbp(
     guard_max_ratio: float = 0.125,
     dem: Tensor | None = None,
     antenna_leaf_gain: str = "pulse",
+    nearfield: bool = True,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -430,6 +431,14 @@ def ffbp(
           hard edge across the beam-edge pixels is not representable by
           any frozen gain.
 
+    nearfield : bool
+        Enable the automatic near-field handling (default True). Where the
+        top merge subaperture images cannot be interpolated cleanly (the
+        aperture-induced range-spectrum spread at close range exceeds the
+        sampling margin), the top of the merge tree is split deeper and the
+        affected rows are re-assembled directly from the small-aperture
+        children onto the output grid.
+
     Returns
     -------
     img : Tensor
@@ -546,6 +555,7 @@ def ffbp(
         dem_grid=grid,
         data_interp_method=data_interp_method,
         antenna_leaf_gain=antenna_leaf_gain,
+        nearfield=nearfield,
     )
     # A small shortfall only truncates the window support of guard bins,
     # whose error reaches the scene attenuated by the interpolation kernel
@@ -666,6 +676,37 @@ def _subaperture_gain_apply(
     return img, w1_full, w2_full
 
 
+def _nearfield_spread(m2: float, rp: float, tp: float, z0: float,
+                      dr_child: float, fc: float) -> float:
+    """Worst-case local range-frequency spread (radians per range sample) of
+    a subaperture image's content at pixel (rp, tp).
+
+    Per-sweep d(R)/dr at the pixel is f(y) = (rp - tp*y)/R(y) over the
+    subaperture's along-track offsets y. The image's local range spectrum
+    spans 2k*dr_child*(f(y) - f(0)). To second order the excursion is the
+    odd term |f'(0)|*h plus the even term |f''(0)|*h^2/2 with h the
+    half-aperture (sqrt(3*m2) for a uniform pulse distribution). The mean
+    shift is compensated by the merge kernels (ffbp_merge2_range_fmod), but
+    the spread cannot be removed pointwise. When it exceeds the sampling
+    margin the merge interpolation of that subaperture aliases.
+    """
+    k = 4.0 * math.pi * fc / 299792458.0
+    h = math.sqrt(3.0 * max(m2, 0.0))
+    A = rp * rp + z0 * z0
+    A15 = A * math.sqrt(max(A, 1e-12))
+    fp = abs(tp) * z0 * z0 / A15
+    fpp = (rp / A15) * abs(1.0 + tp * tp * (2.0 - 3.0 * rp * rp / A))
+    return k * dr_child * (fp * h + 0.5 * fpp * h * h)
+
+
+def _nearfield_spread_max(m2: float, rp: float, t0: float, t1: float,
+                          z0: float, dr_child: float, fc: float) -> float:
+    """Maximum of _nearfield_spread over the grid theta extent (the odd term
+    peaks at the theta edges, the even term near broadside)."""
+    tps = (0.0, 0.5 * abs(t0), 0.5 * abs(t1), abs(t0), abs(t1))
+    return max(_nearfield_spread(m2, rp, tp, z0, dr_child, fc) for tp in tps)
+
+
 def _ffbp_impl(
     data: Tensor,
     grid: dict,
@@ -700,6 +741,7 @@ def _ffbp_impl(
     dem_off: Tensor | None = None,
     data_interp_method: "str | tuple" = "linear",
     antenna_leaf_gain: str = "pulse",
+    nearfield: bool = True,
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients.
 
@@ -743,10 +785,69 @@ def _ffbp_impl(
     dtheta_node = (theta1_g - theta0_g) / grid["ntheta"]
     core_ntheta = round((core_t1 - core_t0) / dtheta_node)
 
+    # The final merge interpolates aperture/divisions-sized child images. At
+    # ranges comparable to the child aperture their local range spectrum
+    # spreads beyond the sampling margin (see _nearfield_spread) and the
+    # rows decorrelate. Where the criterion fires, split the top level
+    # nf_extra levels deeper and re-assemble the affected rows directly from
+    # the small-aperture children onto the final grid (complex addition, no
+    # child-to-child interpolation) after the normal reduction. Far rows are
+    # untouched and only the near band pays the extra lookups.
+    nf_extra = 0
+    nf_band_nr = 0
+    nf_children = None
+    divisions_split = divisions
+    if (nearfield and is_top_level and stages > 1 and divisions % 2 == 0
+            and nsweeps >= 4 * divisions):
+        # Free spectral band implied by the alias_fmod placement (inverse of
+        # the alias_fmod formula); half of it as the usable margin.
+        nf_thr = 0.5 * max(0.2, 2.0 * math.pi + 2.0 * alias_fmod)
+        r0_g, r1_g = grid["r"]
+        t0_g, t1_g = core_theta
+        dr_g = (r1_g - r0_g) / grid["nr"]
+        dr_child_nf = dr_g / max(oversample_r, 1.0)
+        z0_g = sum(pos_z) / len(pos_z)
+        cy_all = sum(y for _, y in pos_xy) / nsweeps
+        m2_all = sum((y - cy_all) ** 2 for _, y in pos_xy) / nsweeps
+        # Deeper levels divide the aperture (and so the variance) by
+        # divisions^2 per level (uniform pulse spacing approximation).
+        m2_l1 = m2_all / divisions ** 2
+        if _nearfield_spread_max(m2_l1, r0_g, t0_g, t1_g, z0_g,
+                                 dr_child_nf, fc) > nf_thr:
+            # First row where the normal tree's final-merge children are
+            # cleanly interpolable; rows below it get re-assembled.
+            nr_g = grid["nr"]
+            step = max(1, nr_g // 256)
+            row = 0
+            while row < nr_g and _nearfield_spread_max(
+                    m2_l1, r0_g + dr_g * row, t0_g, t1_g, z0_g,
+                    dr_child_nf, fc) > nf_thr:
+                row += step
+            nf_band_nr = min(row + step, nr_g)
+            # Assembly depth: smallest extra depth whose subapertures are
+            # clean at the grid's minimum range.
+            nf_extra = 1
+            while (nf_extra < 4
+                   and divisions ** (2 + nf_extra) * 2 <= nsweeps
+                   and _nearfield_spread_max(
+                       m2_all / divisions ** (2 * (1 + nf_extra)), r0_g,
+                       t0_g, t1_g, z0_g, dr_child_nf, fc) > nf_thr):
+                nf_extra += 1
+            if _nearfield_spread_max(
+                    m2_all / divisions ** (2 * (1 + nf_extra)), r0_g,
+                    t0_g, t1_g, z0_g, dr_child_nf, fc) > nf_thr:
+                warn(f"ffbp: near-field criterion still exceeded at "
+                     f"r={r0_g:.1f} m with the deepest available "
+                     f"subaperture split ({divisions ** (1 + nf_extra)} "
+                     f"children); accuracy of the nearest rows may be "
+                     f"reduced. Increase the grid minimum range or use "
+                     f"direct backprojection for this grid.")
+            divisions_split = divisions ** (1 + nf_extra)
+
     # Split at rounded boundaries so that no sweeps are dropped when
     # divisions does not divide nsweeps. Subaperture sizes differ by at most
     # one sweep, which the merge handles.
-    bounds = split_bounds(nsweeps, divisions)
+    bounds = split_bounds(nsweeps, divisions_split)
 
     # Children guard sizing. A merge output pixel at theta = t reads the
     # child image at tp = (d*t + dy)/rp, so the child grid must cover the
@@ -756,7 +857,7 @@ def _ffbp_impl(
     # child up to the window margin. It is evaluated with the exact kernel
     # formula: the linearization |dy|/r0 wildly overestimates when the
     # subaperture offsets are comparable to the near range.
-    div_xy = [pos_xy[bounds[i]:bounds[i + 1]] for i in range(divisions)]
+    div_xy = [pos_xy[bounds[i]:bounds[i + 1]] for i in range(divisions_split)]
     means = [(sum(x for x, _ in s) / len(s), sum(y for _, y in s) / len(s))
              for s in div_xy]
     # True centroid over all node pulses: the intermediate merges track it
@@ -793,7 +894,8 @@ def _ffbp_impl(
     a_bins = interp_method[1] // 2 + 1
 
     imgs = []
-    for d_idx in range(divisions):
+    stages_child = stages - 1 - nf_extra
+    for d_idx in range(divisions_split):
         i0, i1 = bounds[d_idx], bounds[d_idx + 1]
         pos_local, origin_local = center_pos(pos[i0:i1])
         pos_z_local = pos_z[i0:i1]
@@ -803,7 +905,7 @@ def _ffbp_impl(
         # merges. Applies to both the recursive and the base backprojection
         # branch; deeper levels receive oversample=1 since the grid is
         # already increased.
-        core_nt_child = (core_ntheta + divisions - 1) // divisions
+        core_nt_child = (core_ntheta + divisions_split - 1) // divisions_split
         core_nt_child = int(oversample_theta * core_nt_child)
         dth_child = (core_t1 - core_t0) / core_nt_child
 
@@ -897,14 +999,14 @@ def _ffbp_impl(
         if dem is not None:
             dem_off_local = dem_off + origin_local[0][:2]
 
-        if stages > 1 and len(data_local) >= 2 * divisions and next_core >= min_core:
+        if stages_child >= 1 and len(data_local) >= 2 * divisions and next_core >= min_core:
             img, w1_map, w2_map, weight_grid = _ffbp_impl(
                 data_local,
                 grid_local,
                 fc,
                 r_res,
                 pos_local,
-                stages=stages - 1,
+                stages=stages_child,
                 divisions=divisions,
                 d0=d0,
                 interp_method=interp_method,
@@ -1072,7 +1174,8 @@ def _ffbp_impl(
         imgs.append((origin_local[0], grid_local, img, z0, w1_map, w2_map,
                      weight_grid, len(data_local), cy_loc, m2_loc))
 
-    def _merge_pair(img1, img2, is_final_merge):
+    def _merge_pair(img1, img2, is_final_merge, target_grid=None,
+                    override_z=None):
         # Pulse-count-weighted origin so the running frame tracks the true phase
         # center of the combined pulses. Plain 0.5/0.5 averaging only reaches
         # the node centroid for balanced trees. The final merge lands on the
@@ -1088,6 +1191,11 @@ def _ffbp_impl(
         else:
             new_origin = (n1 * img1[0] + n2 * img2[0]) / nsum
         new_z = (n1 * img1[3] + n2 * img2[3]) / nsum
+        if override_z is not None:
+            # Near-band partial assembly: all partial sums must reference
+            # the same carrier z as the full final image so their pixel-wise
+            # sum and the row overwrite are phase-consistent.
+            new_z = override_z
         # Combined pulse centroid / along-track variance (parallel axis
         # theorem); the children's own variances feed this merge's spectral
         # shift compensation.
@@ -1101,7 +1209,7 @@ def _ffbp_impl(
         out_alias = output_alias
         if is_final_merge:
             # Interpolate the final image to the desired grid.
-            grid_polar_new = grid
+            grid_polar_new = grid if target_grid is None else target_grid
             alias = not dealias
         else:
             # Union of the source extents (the per-child guard bands are
@@ -1212,6 +1320,39 @@ def _ffbp_impl(
     # odd image to the next pass. Adjacency keeps every intermediate
     # a contiguous aperture, the pass structure keeps the tree log-depth for any
     # divisions. The final merge is the single pair of the last pass (len == 2).
+    nf_band_img = None
+    nf_band_w1 = None
+    nf_band_w2 = None
+    if nf_band_nr > 0:
+        # Near-band assembly
+        # Rows the final merges cannot interpolate cleanly are formed from
+        # the small-aperture children, each pair evaluated directly onto
+        # the final grid (frame origin, final carrier z, final alias mode).
+        # All partials share the same per-pixel carrier, so combining them
+        # is a plain complex addition. Done before the reduction while all
+        # children are resident anyway, so peak memory matches the normal
+        # path (only the small band partials are extra). The band rows of
+        # the final image are overwritten after the reduction.
+        z_final = sum(pos_z) / len(pos_z)
+        r0_g, r1_g = grid["r"]
+        dr_g = (r1_g - r0_g) / grid["nr"]
+        band_grid = deepcopy(grid)
+        band_grid["r"] = (r0_g, r0_g + dr_g * nf_band_nr)
+        band_grid["nr"] = nf_band_nr
+        for k in range(0, len(imgs) - 1, 2):
+            part = _merge_pair(imgs[k], imgs[k + 1], True,
+                               target_grid=band_grid, override_z=z_final)
+            if nf_band_img is None:
+                nf_band_img = part[2]
+                nf_band_w1 = part[4]
+                nf_band_w2 = part[5]
+            else:
+                nf_band_img += part[2]
+                if nf_band_w1 is not None and part[4] is not None:
+                    nf_band_w1 += part[4]
+                    nf_band_w2 += part[5]
+            part = None
+
     while len(imgs) > 1:
         is_final_pass = len(imgs) == 2
         next_imgs = []
@@ -1224,6 +1365,18 @@ def _ffbp_impl(
             # Odd trailing image carried unmerged to the next pass.
             next_imgs.append(imgs[-1])
         imgs = next_imgs
+
+    if nf_band_nr > 0:
+        top = imgs[0]
+        top[2][:nf_band_nr, :] = nf_band_img
+        nf_band_img = None
+        if use_antenna_pattern and top[4] is not None and nf_band_w1 is not None:
+            # Top-level final merge emits full-resolution weight maps, and
+            # so do the band partials (same is_final_merge path).
+            top[4][:nf_band_nr, :] = nf_band_w1
+            top[5][:nf_band_nr, :] = nf_band_w2
+        nf_band_w1 = None
+        nf_band_w2 = None
 
     # Return different values depending on whether we're at top level or recursive
     # At top level (called from ffbp), just return the image
