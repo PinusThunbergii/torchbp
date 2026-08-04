@@ -31,6 +31,55 @@ import inspect
 #: Speed of light in vacuum [m/s]. Must match ``kC0`` in ``csrc/cpu/util.h``.
 C0 = 299792458.0
 
+#: Default cap on the antenna weight rows :class:`_AntennaWeightCache`
+#: instances may retain between autofocus iterations, summed over all of
+#: them. One row is one float per sweep, so a block-divided image on a long
+#: track caches gigabytes if left unbounded.
+WEIGHT_CACHE_BYTES = 1 << 30
+
+#: Peak workspace :func:`_batched_eigh` allows cuSOLVER per chunk.
+_EIGH_WORKSPACE_BYTES = 256 << 20
+
+#: Peak transient :func:`_antenna_weights` allows per target chunk.
+_ANT_WEIGHT_CHUNK_BYTES = 256 << 20
+
+
+def _batched_eigh(
+    a: Tensor, max_workspace: int = _EIGH_WORKSPACE_BYTES
+) -> tuple[Tensor, Tensor]:
+    """Batched symmetric eigendecomposition with a bounded workspace.
+
+    ``torch.linalg.eigh`` dispatches small batched matrices to cuSOLVER's
+    batched Jacobi solver, whose workspace is proportional to the batch
+    size and roughly 7500 times the size of the input: about 270 kB per
+    3x3 float32 matrix, so a per-sweep 3x3 solve over 40k sweeps asks for
+    10 GB up front. The decomposition is independent per batch element, so
+    run it in chunks sized to keep the workspace near ``max_workspace``.
+    Results are bit-identical to the unchunked call.
+    """
+    if a.ndim <= 2 or a.device.type != "cuda":
+        return torch.linalg.eigh(a)
+    n = a.shape[-1]
+    batch_shape = a.shape[:-2]
+    batch = int(np.prod(batch_shape)) if len(batch_shape) else 1
+    # Measured cuSOLVER syevjBatched workspace per matrix, with margin.
+    per_item = 8192 * n * n * a.element_size()
+    chunk = max(1, max_workspace // per_item)
+    if chunk >= batch:
+        return torch.linalg.eigh(a)
+    flat = a.reshape(batch, n, n)
+    rdtype = a.real.dtype if a.is_complex() else a.dtype
+    evals = torch.empty((batch, n), dtype=rdtype, device=a.device)
+    evecs = torch.empty((batch, n, n), dtype=a.dtype, device=a.device)
+    for i in range(0, batch, chunk):
+        e, v = torch.linalg.eigh(flat[i : i + chunk])
+        evals[i : i + chunk] = e
+        evecs[i : i + chunk] = v
+    return (
+        evals.reshape(*batch_shape, n),
+        evecs.reshape(*batch_shape, n, n),
+    )
+
 
 def pga_estimator(
     g: Tensor,
@@ -1169,6 +1218,27 @@ def _antenna_weights(
     w : Tensor
         Antenna amplitude weight. Shape [ntargets, nsweeps].
     """
+    # The bilinear lookup below holds about twenty [ntargets, nsweeps]
+    # temporaries at once, twenty times the size of the result. Targets are
+    # independent, so evaluate them in chunks sized to keep that transient
+    # near _ANT_WEIGHT_CHUNK_BYTES instead of letting it scale with the
+    # target count.
+    ntargets, nsweeps = target_pos.shape[0], pos.shape[0]
+    elem = max(pos.element_size(), g.element_size())
+    chunk = max(1, _ANT_WEIGHT_CHUNK_BYTES // max(20 * nsweeps * elem, 1))
+    if ntargets > chunk:
+        first = _antenna_weights(target_pos[:chunk], pos, att, g, g_extent)
+        w = torch.empty(
+            (ntargets, nsweeps), dtype=first.dtype, device=first.device
+        )
+        w[:chunk] = first
+        del first
+        for i in range(chunk, ntargets, chunk):
+            w[i : i + chunk] = _antenna_weights(
+                target_pos[i : i + chunk], pos, att, g, g_extent
+            )
+        return w
+
     g_el0, g_az0, g_el1, g_az1 = g_extent
     g_nel, g_naz = g.shape
     g_del = (g_el1 - g_el0) / g_nel
@@ -1288,6 +1358,33 @@ def _antenna_spectrum_weights(
     return torch.where(inside, wq, torch.zeros_like(wq))
 
 
+class _WeightCacheBudget:
+    """Shared cap on the rows :class:`_AntennaWeightCache` instances retain.
+
+    One cache per image block, each holding one float per (target, sweep),
+    adds up: a 10x10 block division of a long track reaches several GB,
+    which on a large scene is more than the image and the solve together.
+    The caches share this budget and the ones that do not fit simply
+    recompute their rows every iteration, which costs a few milliseconds
+    per block and no memory beyond the rows they were going to return
+    anyway.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.used = 0
+
+    def acquire(self, nbytes: int, held: int) -> bool:
+        """Try to resize a cache's holding from ``held`` to ``nbytes``."""
+        if self.used - held + nbytes > self.limit:
+            return False
+        self.used += nbytes - held
+        return True
+
+    def release(self, held: int) -> None:
+        self.used -= held
+
+
 class _AntennaWeightCache:
     """Cache of :func:`_antenna_weights` rows across gpga iterations.
 
@@ -1303,9 +1400,18 @@ class _AntennaWeightCache:
     when its reselected target moved past it. Only targets failing these
     checks are recomputed, so the weight error is bounded by about one
     pattern cell's worth of the cell-to-cell variation.
+
+    Retention is capped by an optional shared :class:`_WeightCacheBudget`;
+    a cache that does not fit under it recomputes every row every call.
     """
 
-    def __init__(self, att: Tensor, g: Tensor, g_extent: list):
+    def __init__(
+        self,
+        att: Tensor,
+        g: Tensor,
+        g_extent: list,
+        budget: "_WeightCacheBudget | None" = None,
+    ):
         self._att = att
         self._g = g
         self._g_extent = g_extent
@@ -1313,14 +1419,27 @@ class _AntennaWeightCache:
         self._tol = 0.5 * min(
             (g_el1 - g_el0) / g.shape[0], (g_az1 - g_az0) / g.shape[1]
         )
+        self._budget = budget
         self._pos_ref = None
         self._r_min = float("inf")
-        # key -> (target position [3], weight row [nsweeps]). Only the raw
-        # rows are cached: the derived wn/wpair products are recomputed
-        # per call as whole-matrix ops, which is a few cheap passes,
-        # instead of tripling the cache's resident memory (the rows
-        # already reach hundreds of MB on large scenes).
-        self._rows = {}
+        # The cache holds exactly the rows the last get() returned, as one
+        # contiguous [ncached, nsweeps] tensor plus a key -> row index map,
+        # so its footprint is one block's weight matrix and is accounted
+        # exactly. Only the raw rows are kept: the derived wn/wpair
+        # products are recomputed per call as whole-matrix ops, which is a
+        # few cheap passes, instead of tripling the resident memory.
+        self._w = None
+        self._tpos = None
+        self._index = {}
+        self._held = 0
+
+    def _drop(self) -> None:
+        if self._budget is not None:
+            self._budget.release(self._held)
+        self._w = None
+        self._tpos = None
+        self._index = {}
+        self._held = 0
 
     def get(
         self, keys: list, target_pos: Tensor, pos: Tensor
@@ -1345,24 +1464,35 @@ class _AntennaWeightCache:
                 torch.max(torch.linalg.norm(pos - self._pos_ref, dim=-1))
             )
             if drift > self._r_min * self._tol:
-                self._rows.clear()
+                self._drop()
                 self._pos_ref = None
         if self._pos_ref is None:
             self._pos_ref = pos.clone()
             self._r_min = float("inf")
-        missing = [i for i, k in enumerate(keys) if k not in self._rows]
-        hits = [i for i, k in enumerate(keys) if k in self._rows]
-        if hits:
+        hit_src, hit_dst, missing = [], [], []
+        for i, k in enumerate(keys):
+            j = self._index.get(k)
+            if j is None:
+                missing.append(i)
+            else:
+                hit_src.append(j)
+                hit_dst.append(i)
+        if hit_dst:
             # One vectorized distance check (and one device sync) for all
             # cached candidates: a reselected target that moved past the
             # angular budget gets its row recomputed.
-            cached_pos = torch.stack([self._rows[keys[i]][0] for i in hits])
             far = (
-                torch.linalg.norm(target_pos[hits] - cached_pos, dim=-1)
+                torch.linalg.norm(
+                    target_pos[hit_dst] - self._tpos[hit_src], dim=-1
+                )
                 > self._r_min * self._tol
             ).tolist()
-            missing += [i for i, f in zip(hits, far) if f]
+            missing += [i for i, f in zip(hit_dst, far) if f]
             missing.sort()
+            kept = [(s, d) for s, d, f in zip(hit_src, hit_dst, far) if not f]
+            hit_src = [s for s, _ in kept]
+            hit_dst = [d for _, d in kept]
+        w = None
         if missing:
             miss_pos = target_pos[missing]
             w_new = _antenna_weights(
@@ -1374,13 +1504,35 @@ class _AntennaWeightCache:
             c = torch.mean(pos, dim=0)
             track_r = torch.max(torch.linalg.norm(pos - c, dim=-1))
             d_min = torch.min(torch.linalg.norm(miss_pos - c, dim=-1))
-            self._r_min = min(
-                self._r_min, max(float(d_min - track_r), 1.0)
+            self._r_min = min(self._r_min, max(float(d_min - track_r), 1.0))
+            if len(missing) == len(keys):
+                # Everything missed (first call, or the track drifted past
+                # the tolerance). Adopt the fresh rows instead of copying
+                # them into a second full-size buffer.
+                w = w_new
+        if w is None:
+            # Take dtype/device from whichever source exists: with no keys
+            # missing and none hitting the call returned above.
+            proto = w_new if missing else self._w
+            w = torch.empty(
+                (len(keys), pos.shape[0]),
+                dtype=proto.dtype,
+                device=proto.device,
             )
-            for j, i in enumerate(missing):
-                self._rows[keys[i]] = (target_pos[i], w_new[j])
-        w = torch.stack([self._rows[k][1] for k in keys])
-        self._rows = {k: self._rows[k] for k in keys}
+            if hit_dst:
+                w[hit_dst] = self._w[hit_src]
+            if missing:
+                w[missing] = w_new
+                del w_new
+        # The returned rows become the cache: same content, no extra copy.
+        nbytes = w.numel() * w.element_size()
+        if self._budget is None or self._budget.acquire(nbytes, self._held):
+            self._w = w
+            self._tpos = target_pos.clone()
+            self._index = {k: i for i, k in enumerate(keys)}
+            self._held = nbytes
+        else:
+            self._drop()
         wn = w / torch.clamp(torch.amax(w, dim=1, keepdim=True), min=1e-12)
         wpair = wn * torch.nn.functional.pad(wn[..., :-1], (1, 0))
         return w, wn, wpair
@@ -1814,6 +1966,7 @@ def gpga_tde(
     verbose: bool = False,
     data_fmod: float = 0,
     dem: Tensor | None = None,
+    weight_cache_bytes: int = WEIGHT_CACHE_BYTES,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus [1]_ with time-domain error (TDE) 3D
@@ -1954,6 +2107,13 @@ def gpga_tde(
         See :func:`torchbp.util.dem_to_polar`
         for resampling a Cartesian DEM onto the polar grid. If None
         (default) targets are assumed to lie on the z=0 plane.
+    weight_cache_bytes : int
+        Total memory the per-block antenna weight caches may retain between
+        iterations. One cached row is one float per sweep per target, so
+        with many blocks on a long track the caches would otherwise grow to
+        several GB. Blocks that do not fit recompute their rows each
+        iteration, which costs a few milliseconds per block. Only used when
+        the antenna pattern is given.
 
 
     References
@@ -1989,11 +2149,13 @@ def gpga_tde(
     use_antenna_weight = (
         att is not None and g is not None and g_extent is not None
     )
-    # Per-block caches: target keys are block-local row indices.
+    # Per-block caches: target keys are block-local row indices. They share
+    # one memory budget; blocks past it recompute their rows each iteration.
     ant_caches = None
     if use_antenna_weight:
+        cache_budget = _WeightCacheBudget(weight_cache_bytes)
         ant_caches = [
-            _AntennaWeightCache(att, g, g_extent)
+            _AntennaWeightCache(att, g, g_extent, cache_budget)
             for _ in range(range_divisions * azimuth_divisions)
         ]
 
@@ -2182,7 +2344,7 @@ def gpga_tde(
         b = w * s
         AtA = A.transpose(-1, -2) @ A
         Atb = A.transpose(-1, -2) @ b
-        evals, evecs = torch.linalg.eigh(AtA)
+        evals, evecs = _batched_eigh(AtA)
         evinv = torch.where(
             evals > solve_threshold * torch.max(evals), 1 / evals, 0.0
         )

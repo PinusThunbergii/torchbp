@@ -949,6 +949,182 @@ class TestGpgaDem(TestGpgaBpPolar):
 
 
 
+class TestBatchedEigh(TestCase):
+    """_batched_eigh matches torch.linalg.eigh with a bounded workspace.
+
+    cuSOLVER's batched Jacobi solver takes a workspace proportional to the
+    batch size and thousands of times the input size, so the per-sweep 3x3
+    solve in gpga_tde asked for 10 GB on a 40k-sweep collection.
+    """
+
+    def _sym(self, batch, n):
+        a = torch.randn(batch, 4 * n, n)
+        return (a.transpose(-1, -2) @ a).contiguous()
+
+    def test_matches_unchunked(self):
+        for n in (2, 3):
+            a = self._sym(700, n)
+            ref_e, ref_v = torch.linalg.eigh(a)
+            # Force many chunks: workspace budget of a few matrices.
+            e, v = torchbp.autofocus._batched_eigh(
+                a, max_workspace=8192 * n * n * a.element_size() * 3
+            )
+            self.assertEqual(e, ref_e)
+            self.assertEqual(v, ref_v)
+
+    def test_reconstructs_input(self):
+        a = self._sym(700, 3)
+        e, v = torchbp.autofocus._batched_eigh(
+            a, max_workspace=8192 * 9 * a.element_size() * 3
+        )
+        rec = v @ torch.diag_embed(e) @ v.transpose(-1, -2)
+        self.assertEqual(rec, a, atol=1e-4, rtol=1e-4)
+
+    def test_passthrough_shapes(self):
+        # Unbatched input, and a batch shape with more than one leading dim.
+        a2 = self._sym(1, 3)[0]
+        e, v = torchbp.autofocus._batched_eigh(a2)
+        self.assertEqual(e, torch.linalg.eigh(a2)[0])
+        a4 = self._sym(60, 3).reshape(5, 12, 3, 3)
+        e, v = torchbp.autofocus._batched_eigh(
+            a4, max_workspace=8192 * 9 * a4.element_size() * 3
+        )
+        self.assertEqual(e.shape, torch.Size([5, 12, 3]))
+        self.assertEqual(v.shape, torch.Size([5, 12, 3, 3]))
+        self.assertEqual(e, torch.linalg.eigh(a4)[0])
+
+
+class TestAntennaWeightMemory(TestCase):
+    """Antenna weight chunking and the weight cache budget.
+
+    The per-block caches hold one float per (target, sweep), unbounded they
+    reached several GB on a block-divided long collection causing OOM.
+    """
+
+    g_extent = [-0.6, -0.5, 0.3, 0.5]
+    nsweeps = 200
+    ntargets = 40
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(1)
+        self.g = torch.rand(16, 32)
+        n = self.nsweeps
+        self.pos = torch.stack([
+            torch.zeros(n), torch.linspace(0, 40, n), torch.full((n,), 30.0)
+        ], dim=-1)
+        self.att = torch.zeros(n, 3)
+        self.att[:, 0] = -0.17
+
+    def _tpos(self, keys):
+        k = torch.as_tensor(list(keys), dtype=torch.float32)
+        return torch.stack(
+            [60 + 2 * k, -20 + 1.5 * k, torch.zeros_like(k)], dim=-1
+        ).to(self.pos.device)
+
+    def _direct(self, tpos):
+        return torchbp.autofocus._antenna_weights(
+            tpos, self.pos, self.att, self.g, self.g_extent
+        )
+
+    def test_chunked_antenna_weights_match(self):
+        tpos = self._tpos(range(self.ntargets))
+        saved = torchbp.autofocus._ANT_WEIGHT_CHUNK_BYTES
+        try:
+            torchbp.autofocus._ANT_WEIGHT_CHUNK_BYTES = 1 << 40
+            ref = self._direct(tpos)
+            # Budget for ~4 targets per chunk, so the loop runs many times.
+            torchbp.autofocus._ANT_WEIGHT_CHUNK_BYTES = (
+                20 * self.nsweeps * tpos.element_size() * 4
+            )
+            chunked = self._direct(tpos)
+        finally:
+            torchbp.autofocus._ANT_WEIGHT_CHUNK_BYTES = saved
+        self.assertEqual(chunked, ref)
+
+    def test_cache_rows_follow_keys(self):
+        cache = torchbp.autofocus._AntennaWeightCache(
+            self.att, self.g, self.g_extent
+        )
+        keys = list(range(self.ntargets))
+        tpos = self._tpos(keys)
+        w1, _, _ = cache.get(keys, tpos, self.pos)
+        self.assertEqual(w1, self._direct(tpos))
+
+        # Reordered subset of cached keys: rows must follow the given order.
+        sub = [30, 3, 21, 7]
+        w2, _, _ = cache.get(sub, self._tpos(sub), self.pos)
+        self.assertEqual(w2, w1[[keys.index(k) for k in sub]])
+
+        # Interleaved hits and misses land in the right rows.
+        mixed = [21, 900, 3, 901]
+        w3, _, _ = cache.get(mixed, self._tpos(mixed), self.pos)
+        direct = self._direct(self._tpos(mixed))
+        self.assertEqual(w3[0], w1[21])
+        self.assertEqual(w3[2], w1[3])
+        self.assertEqual(w3[1], direct[1])
+        self.assertEqual(w3[3], direct[3])
+
+        # A key dropped by the previous calls is recomputed, not resurrected.
+        w4, _, _ = cache.get([30], self._tpos([30]), self.pos)
+        self.assertEqual(w4, self._direct(self._tpos([30])))
+
+    def test_cache_derived_products(self):
+        cache = torchbp.autofocus._AntennaWeightCache(
+            self.att, self.g, self.g_extent
+        )
+        keys = list(range(self.ntargets))
+        for _ in range(2):
+            w, wn, wpair = cache.get(keys, self._tpos(keys), self.pos)
+            self.assertEqual(
+                wn, w / torch.clamp(w.amax(1, keepdim=True), min=1e-12)
+            )
+            self.assertEqual(
+                wpair, wn * torch.nn.functional.pad(wn[..., :-1], (1, 0))
+            )
+
+    def test_budget_zero_never_retains(self):
+        budget = torchbp.autofocus._WeightCacheBudget(0)
+        cache = torchbp.autofocus._AntennaWeightCache(
+            self.att, self.g, self.g_extent, budget
+        )
+        keys = list(range(self.ntargets))
+        tpos = self._tpos(keys)
+        for _ in range(3):
+            w, _, _ = cache.get(keys, tpos, self.pos)
+            # Nothing retained, so every call recomputes exactly.
+            self.assertEqual(w, self._direct(tpos))
+        self.assertEqual(budget.used, 0)
+
+    def test_budget_shared_across_caches(self):
+        keys = list(range(self.ntargets))
+        tpos = self._tpos(keys)
+        row_bytes = self.ntargets * self.nsweeps * tpos.element_size()
+        budget = torchbp.autofocus._WeightCacheBudget(row_bytes * 2)
+        caches = [
+            torchbp.autofocus._AntennaWeightCache(
+                self.att, self.g, self.g_extent, budget
+            )
+            for _ in range(5)
+        ]
+        for _ in range(2):
+            for cache in caches:
+                w, _, _ = cache.get(keys, tpos, self.pos)
+                self.assertEqual(w, self._direct(tpos))
+            self.assertLessEqual(budget.used, budget.limit)
+        # Only the caches that fit under the shared budget retain rows.
+        self.assertEqual([c._held > 0 for c in caches],
+                         [True, True, False, False, False])
+
+    def test_empty_keys(self):
+        cache = torchbp.autofocus._AntennaWeightCache(
+            self.att, self.g, self.g_extent
+        )
+        w, wn, wpair = cache.get([], self._tpos([]), self.pos)
+        for t in (w, wn, wpair):
+            self.assertEqual(t.shape, torch.Size([0, self.nsweeps]))
+
+
 class TestPhaseToPos(TestCase):
     """phase_to_pos recovers an injected x position error from pga phase."""
 
@@ -1076,6 +1252,56 @@ class TestInsarRmeBlocksvdCuda(_OnCuda, TestInsarRmeBlocksvd):
 @requires_cuda
 class TestInsarRmeMultisquintCuda(_OnCuda, TestInsarRmeMultisquint):
     pass
+
+
+@requires_cuda
+class TestBatchedEighCuda(_OnCuda, TestBatchedEigh):
+    """The chunking only engages on CUDA. This is the path that matters."""
+
+    def test_workspace_is_bounded(self):
+        # The unchunked cuSOLVER call takes ~270 kB per 3x3 float32 matrix,
+        # so this batch alone would ask for over 5 GB of workspace.
+        a = self._sym(20000, 3)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        e, v = torchbp.autofocus._batched_eigh(a)
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated() - base
+        # Outputs are 60000*(3+9)*4 bytes
+        self.assertLess(extra, 4 * torchbp.autofocus._EIGH_WORKSPACE_BYTES)
+
+
+@requires_cuda
+class TestAntennaWeightMemoryCuda(_OnCuda, TestAntennaWeightMemory):
+
+    def test_antenna_weights_transient_bounded(self):
+        # The bilinear lookup holds ~20 [ntargets, nsweeps] temporaries at
+        # once; unchunked this is where a large block's weights blew up.
+        n, ntgt = 20000, 600
+        pos = torch.stack([
+            torch.zeros(n), torch.linspace(0, 400, n), torch.full((n,), 110.0)
+        ], dim=-1)
+        att = torch.zeros(n, 3)
+        att[:, 0] = -0.17
+        k = torch.linspace(0, 1, ntgt)
+        tpos = torch.stack(
+            [200 + 800 * k, -100 + 600 * k, torch.zeros_like(k)], dim=-1
+        )
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        w = torchbp.autofocus._antenna_weights(
+            tpos, pos, att, self.g, self.g_extent
+        )
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated() - base
+        self.assertEqual(w.shape, torch.Size([ntgt, n]))
+        self.assertLess(
+            extra, 2 * torchbp.autofocus._ANT_WEIGHT_CHUNK_BYTES
+        )
 
 
 @requires_cuda
