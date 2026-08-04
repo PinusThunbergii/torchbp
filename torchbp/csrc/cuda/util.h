@@ -39,6 +39,43 @@ using complex32_t = cuda::std::complex<__half>;
 constexpr int POLY_COEF_MAX = 15;
 __constant__ float d_poly_coefs[POLY_COEF_MAX];
 
+// Fast asin/atan2 for antenna-pattern angle lookups. The results only index
+// the gain table (whose cells are >> 1e-5 rad), so a short polynomial is
+// enough: max error ~2e-8 rad (asin, Abramowitz & Stegun 4.4.46) and
+// ~2e-6 rad (atan2, degree-11 odd minimax + __fdividef), against ~40-60
+// instruction software library implementations.
+__device__ static inline float fast_asinf(float x) {
+    const float ax = fabsf(x);
+    float p =        fmaf(ax, -0.0012624911f, 0.0066700901f);
+    p = fmaf(ax, p, -0.0170881256f);
+    p = fmaf(ax, p,  0.0308918810f);
+    p = fmaf(ax, p, -0.0501743046f);
+    p = fmaf(ax, p,  0.0889789874f);
+    p = fmaf(ax, p, -0.2145988016f);
+    p = fmaf(ax, p,  1.5707963050f);
+    const float r = 1.5707963268f - sqrtf(1.0f - ax) * p;
+    return copysignf(r, x);
+}
+
+__device__ static inline float fast_atan2f(float y, float x) {
+    const float ax = fabsf(x);
+    const float ay = fabsf(y);
+    const float mx = fmaxf(ax, ay);
+    const float mn = fminf(ax, ay);
+    // z in [0, 1]; atan2(0, 0) = 0 by convention.
+    float z = mx == 0.0f ? 0.0f : __fdividef(mn, mx);
+    const float z2 = z * z;
+    float p =        fmaf(z2, -0.011721630f, 0.052653560f);
+    p = fmaf(z2, p, -0.116432027f);
+    p = fmaf(z2, p,  0.193542504f);
+    p = fmaf(z2, p, -0.332623153f);
+    p = fmaf(z2, p,  0.999977233f);
+    float a = z * p;
+    if (ay > ax) a = 1.5707963268f - a;
+    if (x < 0.0f) a = kPI - a;
+    return copysignf(a, y);
+}
+
 template<class T>
 __device__ T interp2d(const T *img, int nx, int ny,
         int x_int, float x_frac, int y_int, float y_frac) {

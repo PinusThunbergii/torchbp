@@ -13,6 +13,66 @@ enum class InterpMethod {
     KNAB
 };
 
+// Cached gather textures for antenna gain tables.
+// One tex2Dgather instruction fetches the 2x2 texel quad,
+// 4 separate loads, bilinear lerp in software at float precision. Hardware
+// filtered fetches would quantize the weights to the 8-bit texture fraction.
+// Gather requires a CUDA array, so the table is staged through one: creation
+// uploads it and a cache hit re-uploads (device-to-device) so an in-place
+// mutation of the source tensor, or the allocator reusing the pointer for
+// a new table of the same shape, is always picked up.
+struct GainTex {
+    cudaTextureObject_t tex;
+    cudaArray_t arr;
+};
+static std::mutex g_gain_tex_mutex;
+static std::map<std::tuple<const void*, int, int>, GainTex> g_gain_tex_cache;
+
+static cudaTextureObject_t gain_texture(const at::Tensor &g_contig,
+        int g_nel, int g_naz, cudaStream_t stream) {
+    const float *ptr = g_contig.data_ptr<float>();
+    const size_t spitch = (size_t)g_naz * sizeof(float);
+    std::lock_guard<std::mutex> lock(g_gain_tex_mutex);
+    const auto key = std::make_tuple((const void*)ptr, g_nel, g_naz);
+    auto it = g_gain_tex_cache.find(key);
+    if (it != g_gain_tex_cache.end()) {
+        TORCH_CHECK(cudaMemcpy2DToArrayAsync(it->second.arr, 0, 0, ptr,
+                spitch, spitch, g_nel, cudaMemcpyDeviceToDevice, stream)
+                == cudaSuccess, "antenna gain texture update failed");
+        return it->second.tex;
+    }
+    if (g_gain_tex_cache.size() > 64) {
+        cudaDeviceSynchronize();
+        for (auto &e : g_gain_tex_cache) {
+            cudaDestroyTextureObject(e.second.tex);
+            cudaFreeArray(e.second.arr);
+        }
+        g_gain_tex_cache.clear();
+    }
+    cudaChannelFormatDesc desc = cudaCreateChannelDesc<float>();
+    cudaArray_t arr = nullptr;
+    TORCH_CHECK(cudaMallocArray(&arr, &desc, g_naz, g_nel,
+            cudaArrayTextureGather) == cudaSuccess,
+            "antenna gain texture array allocation failed");
+    TORCH_CHECK(cudaMemcpy2DToArrayAsync(arr, 0, 0, ptr, spitch, spitch,
+            g_nel, cudaMemcpyDeviceToDevice, stream) == cudaSuccess,
+            "antenna gain texture upload failed");
+    cudaResourceDesc res{};
+    res.resType = cudaResourceTypeArray;
+    res.res.array.array = arr;
+    cudaTextureDesc td{};
+    td.addressMode[0] = cudaAddressModeClamp;
+    td.addressMode[1] = cudaAddressModeClamp;
+    td.filterMode = cudaFilterModePoint;
+    td.readMode = cudaReadModeElementType;
+    td.normalizedCoords = 0;
+    cudaTextureObject_t tex = 0;
+    TORCH_CHECK(cudaCreateTextureObject(&tex, &res, &td, nullptr) == cudaSuccess,
+            "antenna gain texture creation failed");
+    g_gain_tex_cache.emplace(key, GainTex{tex, arr});
+    return tex;
+}
+
 template<typename T, bool HasAntennaPattern, bool Normalize = true, InterpMethod Method = InterpMethod::LINEAR, bool HasDem = false>
 __global__ void backprojection_polar_2d_kernel(
           const T* __restrict__ data,
@@ -42,6 +102,7 @@ __global__ void backprojection_polar_2d_kernel(
           float g_del,
           int g_naz,
           int g_nel,
+          cudaTextureObject_t g_tex,
           const float* __restrict__ dem,
           float dem_r_scale,
           float dem_theta_scale,
@@ -118,6 +179,14 @@ __global__ void backprojection_polar_2d_kernel(
     const int pos_batch_offset = idbatch * nsweeps * 3;
     const int data_batch_stride = idbatch * sweep_samples * nsweeps;
     const int max_id0 = sweep_samples - 2;
+
+    // Hoisted reciprocals: / g_del and / g_daz in the sweep loop are not
+    // strength-reduced by the compiler (float division is inexact).
+    float inv_g_del, inv_g_daz;
+    if constexpr (HasAntennaPattern) {
+        inv_g_del = 1.0f / g_del;
+        inv_g_daz = 1.0f / g_daz;
+    }
 
     // Fused phase coefficient: phase = phase_coef * (d + d0) + phase_offset2
     // where phase_offset2 = phase_offset - phase_coef * d0
@@ -228,23 +297,35 @@ __global__ void backprojection_polar_2d_kernel(
                 if constexpr (HasAntennaPattern) {
                     float look_angle;
                     if constexpr (HasDem) {
-                        look_angle = asinf(fminf(fmaxf((z[k] - pos_z) / d, -1.0f), 1.0f));
+                        look_angle = fast_asinf(fminf(fmaxf(__fdividef(z[k] - pos_z, d), -1.0f), 1.0f));
                     } else {
-                        look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+                        look_angle = fast_asinf(fmaxf(__fdividef(-pos_z, d), -1.0f));
                     }
                     const float el_deg = look_angle - att_el;
-                    const float az_deg = atan2f(py, px) - att_az;
+                    const float az_deg = fast_atan2f(py, px) - att_az;
 
-                    const float el_idx = (el_deg - g_el0) / g_del;
-                    const float az_idx = (az_deg - g_az0) / g_daz;
+                    const float el_idx = (el_deg - g_el0) * inv_g_del;
+                    const float az_idx = (az_deg - g_az0) * inv_g_daz;
 
                     const int el_int = (int)el_idx;
                     const int az_int = (int)az_idx;
 
                     if (el_idx >= 0.0f && el_int + 1 < g_nel && az_idx >= 0.0f && az_int + 1 < g_naz) {
+                        // One gather fetches the 2x2 texel quad that
+                        // interp2d needed 4 separate loads for. The lerp
+                        // stays in software at full float precision. The
+                        // integer gather coordinate sits exactly on the
+                        // quad boundary, so the selected texels are
+                        // x0/x1 = az_int/az_int+1, y0/y1 = el_int/el_int+1
+                        // with no rounding ambiguity. Component order:
+                        // w=(x0,y0), z=(x1,y0), x=(x0,y1), y=(x1,y1).
                         const float el_frac = el_idx - el_int;
                         const float az_frac = az_idx - az_int;
-                        const float w = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+                        const float4 q = tex2Dgather<float4>(g_tex,
+                                (float)(az_int + 1), (float)(el_int + 1));
+                        const float w_el0 = fmaf(az_frac, q.z - q.w, q.w);
+                        const float w_el1 = fmaf(az_frac, q.y - q.x, q.x);
+                        const float w = fmaf(el_frac, w_el1 - w_el0, w_el0);
 
                         const float ws_re = w * s_re;
                         const float ws_im = w * s_im;
@@ -1509,9 +1590,9 @@ __global__ void projection_cart_2d_kernel(
 
             float norm = 1.0f / d2;
             if (g != nullptr) {
-                const float look   = asinf(fmaxf(dpz / d, -1.0f));
+                const float look   = fast_asinf(fmaxf(__fdividef(dpz, d), -1.0f));
                 const float el_deg = look - att_roll;
-                const float az_deg = atan2f(dpy, dpx) - att_yaw;
+                const float az_deg = fast_atan2f(dpy, dpx) - att_yaw;
                 const float el_idx = (el_deg - g_el0) / g_del;
                 const float az_idx = (az_deg - g_az0) / g_daz;
                 const int el_int = (int)el_idx, az_int = (int)az_idx;
@@ -1724,9 +1805,9 @@ __global__ void projection_nufft_geometry_kernel(
 
     float norm = 1.0f / d2;
     if (g != nullptr) {
-        const float look   = asinf(fmaxf(dpz / d, -1.0f));
+        const float look   = fast_asinf(fmaxf(__fdividef(dpz, d), -1.0f));
         const float el_deg = look - att_s[0];
-        const float az_deg = atan2f(dpy, dpx) - att_s[2];
+        const float az_deg = fast_atan2f(dpy, dpx) - att_s[2];
         const float el_idx = (el_deg - g_el0) / g_del;
         const float az_idx = (az_deg - g_az0) / g_daz;
         const int el_int = (int)el_idx, az_int = (int)az_idx;
@@ -2180,6 +2261,11 @@ at::Tensor backprojection_polar_2d_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    cudaTextureObject_t g_tex = 0;
+    if (antenna_pattern) {
+        g_tex = gain_texture(g_contig, (int)g_nel, (int)g_naz, stream);
+    }
+
     // Use template specialization to eliminate antenna pattern, normalize and DEM branches
     #define LAUNCH_KERNEL(T, has_antenna, do_normalize, use_dem) \
         backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::LINEAR, use_dem> \
@@ -2189,7 +2275,7 @@ at::Tensor backprojection_polar_2d_cuda(
                       phase_coef, phase_offset, delta_r, \
                       r0, dr, theta0, dtheta, Nr, Ntheta, \
                       d0, dealias, z0, dealias_coef, dealias_fmod, \
-                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, g_tex, \
                       dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
     #define LAUNCH_KERNEL_DEM(T, has_antenna, do_normalize) \
         do { \
@@ -2552,6 +2638,11 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    cudaTextureObject_t g_tex = 0;
+    if (antenna_pattern) {
+        g_tex = gain_texture(g_contig, (int)g_nel, (int)g_naz, stream);
+    }
+
     // Use template specialization to eliminate antenna pattern, normalize and DEM branches
     #define LAUNCH_KERNEL(T, has_antenna, do_normalize, use_dem) \
         backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::LANCZOS, use_dem> \
@@ -2561,7 +2652,7 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
                       phase_coef, phase_offset, delta_r, \
                       r0, dr, theta0, dtheta, Nr, Ntheta, \
                       d0, dealias, z0, dealias_coef, dealias_fmod, \
-                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, g_tex, \
                       dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, \
                       order)
     #define LAUNCH_KERNEL_DEM(T, has_antenna, do_normalize) \
@@ -2704,6 +2795,11 @@ at::Tensor backprojection_polar_2d_knab_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    cudaTextureObject_t g_tex = 0;
+    if (antenna_pattern) {
+        g_tex = gain_texture(g_contig, (int)g_nel, (int)g_naz, stream);
+    }
+
     // Use template specialization to eliminate antenna pattern, normalize and DEM branches
     #define LAUNCH_KERNEL(T, has_antenna, do_normalize, use_dem) \
         backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::KNAB, use_dem> \
@@ -2713,7 +2809,7 @@ at::Tensor backprojection_polar_2d_knab_cuda(
                       phase_coef, phase_offset, delta_r, \
                       r0, dr, theta0, dtheta, Nr, Ntheta, \
                       d0, dealias, z0, dealias_coef, dealias_fmod, \
-                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, g_tex, \
                       dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, \
                       order, v)
     #define LAUNCH_KERNEL_DEM(T, has_antenna, do_normalize) \
@@ -3717,6 +3813,11 @@ __global__ void compute_illumination_kernel(
     float w1 = 0.0f;
     float w2 = 0.0f;
 
+    // Hoisted reciprocals: float division is inexact so the compiler cannot
+    // strength-reduce / g_del and / g_daz in the sweep loop.
+    const float inv_g_del = 1.0f / g_del;
+    const float inv_g_daz = 1.0f / g_daz;
+
     for (int i = 0; i < nsweeps; i++) {
         const float pos_x = pos[i * 3 + 0];
         const float pos_y = pos[i * 3 + 1];
@@ -3728,7 +3829,7 @@ __global__ void compute_illumination_kernel(
                          - 2.0f * (x * pos_x + y * pos_y + z * pos_z);
         const float d = sqrtf(fmaxf(d_sq, 0.0f));
 
-        const float look_angle = asinf(fmaxf(-1.0f, fminf(1.0f, (z - pos_z) / d)));
+        const float look_angle = fast_asinf(fmaxf(-1.0f, fminf(1.0f, __fdividef(z - pos_z, d))));
 
         float att_el = 0.0f;
         float att_az = 0.0f;
@@ -3739,11 +3840,11 @@ __global__ void compute_illumination_kernel(
 
         // Antenna-relative angles
         const float el = look_angle - att_el;
-        const float az = atan2f(py, px) - att_az;
+        const float az = fast_atan2f(py, px) - att_az;
 
         // Antenna pattern interpolation
-        const float el_idx = (el - g_el0) / g_del;
-        const float az_idx = (az - g_az0) / g_daz;
+        const float el_idx = (el - g_el0) * inv_g_del;
+        const float az_idx = (az - g_az0) * inv_g_daz;
 
         if (el_idx >= 0 && el_idx < g_nel - 1 && az_idx >= 0 && az_idx < g_naz - 1) {
             // Bilinear interpolation
