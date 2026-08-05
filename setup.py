@@ -36,6 +36,51 @@ library_name = "torchbp"
 # torch you run (see the build-isolation note in pyproject.toml).
 py_limited_api = Version(torch.__version__) >= Version("2.6.0")
 
+# Peak RSS measured for a single compile of the largest sources, rounded up for
+# headroom: nvcc on backproj.cu / polar_interp.cu peaks around 3 GiB, g++ on the
+# CPU sources around 1.6 GiB (most of it is the torch headers).
+_GIB = 1024**3
+_MEM_PER_CUDA_JOB = 4 * _GIB
+_MEM_PER_CXX_JOB = 2 * _GIB
+# Left for the OS, page cache and the final link step.
+_MEM_RESERVE = 4 * _GIB
+
+
+def limit_build_jobs(use_cuda):
+    """Cap ninja's compile parallelism to what fits in RAM.
+
+    torch's ninja backend defaults to #CPUS + 2 concurrent compiles, which is
+    sized for CPU count alone. The CUDA kernels here need ~3 GiB per nvcc
+    process, so on a many-core machine with modest RAM the default overcommits
+    badly and the OOM killer takes down the whole system mid-build. Derive a
+    memory-bound job count instead, unless MAX_JOBS is already set explicitly.
+    """
+    if os.getenv("MAX_JOBS"):
+        return
+
+    try:
+        total_mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        # Not available (e.g. Windows); leave ninja's default alone.
+        return
+
+    ncpu = os.cpu_count() or 1
+    mem_per_job = _MEM_PER_CUDA_JOB if use_cuda else _MEM_PER_CXX_JOB
+    mem_jobs = int((total_mem - _MEM_RESERVE) // mem_per_job)
+    if mem_jobs >= ncpu + 2:
+        # RAM is not the binding constraint, ninja's default already fits.
+        return
+
+    jobs = max(1, mem_jobs)
+    print(
+        f"Limiting build to {jobs} parallel job(s): "
+        f"{total_mem / _GIB:.0f} GiB RAM, {ncpu} CPUs, "
+        f"~{mem_per_job / _GIB:.0f} GiB per compile. "
+        f"Set MAX_JOBS to override."
+    )
+    os.environ["MAX_JOBS"] = str(jobs)
+
+
 def get_extensions():
     debug_mode = os.getenv("DEBUG", "0") == "1"
     use_cuda = os.getenv("USE_CUDA", "1") == "1"
@@ -49,6 +94,8 @@ def get_extensions():
         print("Compiling with cuda support")
     else:
         print("No cuda support")
+
+    limit_build_jobs(use_cuda)
 
     extra_link_args = ["-fopenmp"]
     extra_compile_args = {
