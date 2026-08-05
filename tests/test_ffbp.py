@@ -1157,6 +1157,173 @@ class TestFFBPLongBaselineCuda(TestFFBPLongBaseline):
     device = "cuda"
 
 
+class TestFfbpHalfInternal(TestCase):
+    """complex32 storage of the ffbp tree intermediates (internal_dtype)
+    and of the output image (dtype).
+
+    The images are stored in half precision while all kernel compute and
+    the W1/W2 maps stay fp32, so the result must match the fp32 tree to
+    the per-level store quantization (~1e-3 relative), far inside the
+    merge interpolation error.
+    """
+    device = "cpu"
+
+    def _scene(self, device):
+        torch.manual_seed(7)
+        nsweeps = 128
+        sweep_samples = 512
+        grid = {"r": (30.0, 60.0), "theta": (-0.4, 0.4), "nr": 96,
+                "ntheta": 160}
+        data = torch.randn(nsweeps, sweep_samples, device=device,
+                           dtype=torch.complex64)
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-2, 2, nsweeps, device=device)
+        pos[:, 2] = 25.0
+        nel, naz = 16, 32
+        el = torch.linspace(-1.0, 1.0, nel, device=device)
+        az = torch.linspace(-1.0, 1.0, naz, device=device)
+        g = (torch.exp(-(el[:, None] / 0.7) ** 2)
+             * torch.exp(-(az[None, :] / 0.4) ** 2)).float()
+        g_extent = [el[0].item(), az[0].item(), el[-1].item(), az[-1].item()]
+        att = torch.zeros(nsweeps, 3, device=device)
+        att[:, 0] = -float(np.arcsin(25.0 / 45.0))
+        rr = 30 + 30 / 96 * torch.arange(96, device=device)
+        tt = -0.4 + 0.8 / 160 * torch.arange(160, device=device)
+        dem = (3.0 + 2.0 * torch.sin(rr[:, None] / 5.0) + tt[None, :]).float()
+        return data, grid, pos, att, g, g_extent, dem
+
+    def test_half_internal_matches_fp32(self):
+        device = self.device
+        data, grid, pos, att, g, g_extent, dem = self._scene(device)
+        cases = (dict(),
+                 dict(att=att, g=g, g_extent=g_extent),
+                 dict(att=att, g=g, g_extent=g_extent, dem=dem))
+        for kw in cases:
+            ref = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                                   dealias=True, **kw)
+            res = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                                   dealias=True,
+                                   internal_dtype=torch.complex32, **kw)
+            self.assertEqual(res.dtype, torch.complex64)
+            rel = (torch.linalg.norm(res - ref)
+                   / torch.linalg.norm(ref)).item()
+            self.assertLess(rel, 5e-3)
+            # The half path must actually have been taken.
+            self.assertGreater(rel, 0.0)
+
+    def test_half_output_matches_fp32(self):
+        # dtype=torch.complex32: the whole tree and the returned image are
+        # stored in half (internal_dtype follows dtype). With an antenna
+        # pattern the Wiener normalization runs in-place on the half image
+        # with fp32 maps.
+        device = self.device
+        data, grid, pos, att, g, g_extent, dem = self._scene(device)
+        cases = (dict(),
+                 dict(att=att, g=g, g_extent=g_extent),
+                 dict(att=att, g=g, g_extent=g_extent, dem=dem))
+        for kw in cases:
+            ref = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                                   dealias=True, **kw)
+            res = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                                   dealias=True, dtype=torch.complex32, **kw)
+            self.assertEqual(res.dtype, torch.complex32)
+            rel = (torch.linalg.norm(res.to(torch.complex64) - ref)
+                   / torch.linalg.norm(ref)).item()
+            self.assertLess(rel, 5e-3)
+
+    def test_half_output_fp32_internal(self):
+        # dtype=complex32 with explicit internal_dtype=complex64: only the
+        # top-level final merge stores half, so the error is a single store
+        # quantization plus the in-place normalization round trip.
+        device = self.device
+        data, grid, pos, att, g, g_extent, dem = self._scene(device)
+        kw = dict(att=att, g=g, g_extent=g_extent)
+        ref = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                               dealias=True, **kw)
+        res = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                               dealias=True, dtype=torch.complex32,
+                               internal_dtype=torch.complex64, **kw)
+        self.assertEqual(res.dtype, torch.complex32)
+        rel = (torch.linalg.norm(res.to(torch.complex64) - ref)
+               / torch.linalg.norm(ref)).item()
+        self.assertLess(rel, 2e-3)
+
+    def test_half_output_few_sweeps_fallback(self):
+        # nsweeps < divisions falls back to direct backprojection, which
+        # must still honor the requested output dtype.
+        device = self.device
+        data, grid, pos, att, g, g_extent, dem = self._scene(device)
+        res = torchbp.ops.ffbp(data[:1], grid, 6e9, 0.15, pos[:1], stages=3,
+                               dealias=True, dtype=torch.complex32)
+        self.assertEqual(res.dtype, torch.complex32)
+        self.assertTrue(torch.isfinite(torch.view_as_real(res)).all())
+
+    def test_explicit_complex64_internal_is_default(self):
+        device = self.device
+        data, grid, pos, att, g, g_extent, dem = self._scene(device)
+        kw = dict(att=att, g=g, g_extent=g_extent)
+        a = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                             dealias=True, **kw)
+        b = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                             dealias=True, internal_dtype=torch.complex64,
+                             **kw)
+        self.assertTrue(torch.equal(a, b))
+
+    def test_nearfield_half(self):
+        # Near-field band assembly with an antenna pattern and half
+        # intermediates: the band partials take the final-merge dtype path.
+        torch.manual_seed(5)
+        device = self.device
+        nsweeps = 320
+        grid = {"r": (8.0, 40.0), "theta": (-0.4, 0.4), "nr": 80,
+                "ntheta": 300}
+        data = torch.randn(nsweeps, 256, device=device, dtype=torch.complex64)
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-8.0, 8.0, nsweeps, device=device)
+        pos[:, 2] = 5.0
+        _, _, _, att, g, g_extent, _ = self._scene(device)
+        att = att[:1].repeat(nsweeps, 1)
+        common = dict(dealias=True, oversample_r=1.5, oversample_theta=1.5,
+                      guard_max_ratio=0.5, nearfield=True,
+                      att=att, g=g, g_extent=g_extent)
+        ref = torchbp.ops.ffbp(data, grid, 6e9, 0.3, pos, stages=3, **common)
+        res = torchbp.ops.ffbp(data, grid, 6e9, 0.3, pos, stages=3,
+                               internal_dtype=torch.complex32, **common)
+        self.assertTrue(torch.isfinite(res).all())
+        rel = (torch.linalg.norm(res - ref) / torch.linalg.norm(ref)).item()
+        self.assertLess(rel, 5e-3)
+        # Half output too: the band partials come out of the final-merge
+        # path in complex32 and are accumulated and row-assigned in half.
+        res_h = torchbp.ops.ffbp(data, grid, 6e9, 0.3, pos, stages=3,
+                                 dtype=torch.complex32, **common)
+        self.assertEqual(res_h.dtype, torch.complex32)
+        res_h = res_h.to(torch.complex64)
+        self.assertTrue(torch.isfinite(res_h).all())
+        rel = (torch.linalg.norm(res_h - ref) / torch.linalg.norm(ref)).item()
+        self.assertLess(rel, 5e-3)
+
+    def test_validation(self):
+        device = self.device
+        data, grid, pos, att, g, g_extent, dem = self._scene(device)
+        with self.assertRaises(ValueError):
+            torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                             dtype=torch.float32)
+        with self.assertRaises(ValueError):
+            torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                             dtype=torch.complex32, use_poly=False)
+        with self.assertRaises(ValueError):
+            torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                             internal_dtype=torch.complex32, use_poly=False)
+        with self.assertRaises(ValueError):
+            torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3,
+                             internal_dtype=torch.float32)
+
+
+@requires_cuda
+class TestFfbpHalfInternalCuda(TestFfbpHalfInternal):
+    device = "cuda"
+
+
 class TestFfbpNearField(TestCase):
     """Near-field handling: grids whose minimum range is comparable to the
     subaperture length. The top merges' child images then carry an

@@ -246,6 +246,8 @@ def ffbp(
     dem: Tensor | None = None,
     antenna_leaf_gain: str = "pulse",
     nearfield: bool = True,
+    dtype: torch.dtype = torch.complex64,
+    internal_dtype: torch.dtype | None = None,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -438,7 +440,6 @@ def ffbp(
           (:func:`torchbp.util.taper_antenna_pattern`) — the sweep of a
           hard edge across the beam-edge pixels is not representable by
           any frozen gain.
-
     nearfield : bool
         Enable the automatic near-field handling (default True). Where the
         top merge subaperture images cannot be interpolated cleanly (the
@@ -446,6 +447,27 @@ def ffbp(
         sampling margin), the top of the merge tree is split deeper and the
         affected rows are re-assembled directly from the small-aperture
         children onto the output grid.
+    dtype : torch.dtype
+        Dtype of the returned image: ``torch.complex64`` (default) or
+        ``torch.complex32``. complex32 halves the output image memory;
+        the merge computation and, with an antenna pattern, the W1/W2
+        illumination maps and the Wiener normalization arithmetic stay
+        fp32, so only the final store (and the near-field band partial
+        sums) quantize to half. Requires the polynomial merge kernel and
+        the fp16-range scaling like ``internal_dtype=torch.complex32``,
+        whose default it also sets (``internal_dtype`` of None follows
+        ``dtype``).
+    internal_dtype : torch.dtype or None
+        Storage dtype of the merge tree intermediates. None (default) follows
+        ``dtype``.  ``torch.complex32`` stores the intermediates in half
+        precision, which roughly halves the image memory of the tree while all
+        kernel computation, the W1/W2 illumination maps and the final image (at
+        the default ``dtype``) stay fp32, the quantization error is typically
+        below the merge interpolation error. Requires the polynomial merge
+        kernel (``use_poly`` with interpolation order <= 8). Like complex32 raw
+        data, the intermediate magnitudes must fit the fp16 range (max 65504):
+        the tree accumulates coherently to roughly nsweeps times the per-pulse
+        contribution at the top level, so scale the input data accordingly.
 
     Returns
     -------
@@ -489,6 +511,22 @@ def ffbp(
     if antenna_leaf_gain not in ("pulse", "subaperture"):
         raise ValueError(f"antenna_leaf_gain must be 'pulse' or 'subaperture', "
                          f"got {antenna_leaf_gain!r}")
+
+    if dtype not in (torch.complex64, torch.complex32):
+        raise ValueError(
+            f"dtype must be torch.complex64 or torch.complex32, got {dtype}")
+    if internal_dtype is None:
+        internal_dtype = dtype
+    if internal_dtype not in (torch.complex64, torch.complex32):
+        raise ValueError(
+            f"internal_dtype must be torch.complex64 or torch.complex32, "
+            f"got {internal_dtype}")
+    if (torch.complex32 in (dtype, internal_dtype)
+            and (not use_poly or knab_order > 8)):
+        raise ValueError(
+            "complex32 storage (dtype or internal_dtype) requires the "
+            "polynomial merge kernel: use_poly=True and interpolation "
+            "order <= 8")
 
     if afbp_nsub > 1 and nsweeps >= 2:
         # Definite no-op detection. The polar leaf grids inherit the full
@@ -544,7 +582,7 @@ def ffbp(
             alias_fmod=alias_fmod if (output_alias and dealias) else 0.0,
             att=att, g=g, g_extent=g_extent, dem=dem,
             interp_method=data_interp_method,
-        )[0]
+        )[0].to(dtype)
 
     # Worst (needed / cap) guard shortfall over the whole merge tree,
     # collected during the recursion so that a capped guard warns once per
@@ -564,6 +602,8 @@ def ffbp(
         data_interp_method=data_interp_method,
         antenna_leaf_gain=antenna_leaf_gain,
         nearfield=nearfield,
+        internal_dtype=internal_dtype,
+        output_dtype=dtype,
     )
     # A small shortfall only truncates the window support of guard bins,
     # whose error reaches the scene attenuated by the interpolation kernel
@@ -751,8 +791,14 @@ def _ffbp_impl(
     data_interp_method: "str | tuple" = "linear",
     antenna_leaf_gain: str = "pulse",
     nearfield: bool = True,
+    internal_dtype: torch.dtype = torch.complex64,
+    output_dtype: torch.dtype = torch.complex64,
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients.
+
+    ``internal_dtype`` is the storage dtype of every image below this node's
+    final merge; ``output_dtype`` is the dtype of this node's result (the
+    parent's ``internal_dtype``, or the user-facing dtype at the top level).
 
     ``dem`` is the top-level polar-grid DEM (extent from ``dem_grid``) and
     ``dem_off`` the cumulative xy offset of this node's frame from the
@@ -1043,6 +1089,8 @@ def _ffbp_impl(
                 dem_off=dem_off_local,
                 data_interp_method=data_interp_method,
                 antenna_leaf_gain=antenna_leaf_gain,
+                internal_dtype=internal_dtype,
+                output_dtype=internal_dtype,
             )
         else:
             # Leaf of the merge tree: this is the only place the recursion
@@ -1180,6 +1228,12 @@ def _ffbp_impl(
         cy_loc = sum(y for _, y in pos_xy_local) / n_loc
         m2_loc = sum((y - cy_loc) ** 2 for _, y in pos_xy_local) / n_loc
 
+        # Leaf images convert to the internal storage dtype here (recursive
+        # children already return it); the merge kernels read either dtype
+        # natively, so the fp32 leaf is freed right after the cast.
+        if img.dtype != internal_dtype:
+            img = img.to(internal_dtype)
+
         imgs.append((origin_local[0], grid_local, img, z0, w1_map, w2_map,
                      weight_grid, len(data_local), cy_loc, m2_loc))
 
@@ -1262,6 +1316,12 @@ def _ffbp_impl(
         w1_map1, w2_map1, wgrid1 = img1[4], img1[5], img1[6]
         w1_map2, w2_map2, wgrid2 = img2[4], img2[5], img2[6]
 
+        # Intermediate merges store at the internal dtype; this node's final
+        # merge (and the near-band partials, which take the final-merge path)
+        # emits its result dtype: the parent's internal dtype, or the
+        # user-facing output dtype at the top level.
+        out_dt = output_dtype if is_final_merge else internal_dtype
+
         if use_antenna_pattern and w1_map1 is not None and w2_map1 is not None:
             # Carry the unnormalized accumulation A and the illumination moments
             # W1, W2 up the tree. Wiener normalization is applied once in
@@ -1297,6 +1357,7 @@ def _ffbp_impl(
                 dem=dem_merge,
                 m2_0=m2c1,
                 m2_1=m2c2,
+                out_dtype=out_dt,
             )
         else:
             # Standard merge (no antenna pattern)
@@ -1318,6 +1379,7 @@ def _ffbp_impl(
                 dem=dem_merge,
                 m2_0=m2c1,
                 m2_1=m2c2,
+                out_dtype=out_dt,
             )
             w1_out = None
             w2_out = None

@@ -713,6 +713,7 @@ def ffbp_merge2_poly(
     dem: Tensor | None = None,
     m2_0: float = 0.0,
     m2_1: float = 0.0,
+    out_dtype: "torch.dtype | None" = None,
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -781,6 +782,12 @@ def ffbp_merge2_poly(
         Input images must be dealiased with the matching DEM-referenced
         carrier (``backprojection_polar_2d`` with ``dealias=True`` and the
         same DEM).
+    out_dtype : torch.dtype or None
+        Output image dtype: ``torch.complex64`` or ``torch.complex32``.
+        None (default) matches the input image dtype. Inputs may be
+        complex64 or complex32 (both the same dtype); interpolation taps
+        are converted to fp32 on load, so compute precision is fp32 for
+        either storage.
 
     Returns
     -------
@@ -840,6 +847,7 @@ def ffbp_merge2_poly(
         dem,
         m2_0,
         m2_1,
+        out_dtype,
     )
 
 
@@ -869,6 +877,7 @@ def ffbp_merge2_poly_weighted(
     dem: Tensor | None = None,
     m2_0: float = 0.0,
     m2_1: float = 0.0,
+    out_dtype: "torch.dtype | None" = None,
 ) -> tuple[Tensor, Tensor | None, Tensor | None, "dict | None"]:
     """
     Interpolate two pseudo-polar radar images to new grid with antenna pattern weighting.
@@ -934,6 +943,11 @@ def ffbp_merge2_poly_weighted(
     output_weight_decimation : int
         Decimation factor for output weight maps (1 = no decimation, 4 = 1/16 size).
         Higher values reduce VRAM usage but may reduce weight accuracy.
+    out_dtype : torch.dtype or None
+        Output image dtype: ``torch.complex64`` or ``torch.complex32``.
+        None (default) matches the input image dtype. Inputs may be
+        complex64 or complex32 (both the same dtype); compute stays fp32
+        and the W1/W2 maps stay float32 for either storage.
 
     Returns
     -------
@@ -1029,6 +1043,7 @@ def ffbp_merge2_poly_weighted(
         dem,
         m2_0,
         m2_1,
+        out_dtype,
     )
 
     if output_weight_map:
@@ -1066,6 +1081,7 @@ def ffbp_merge2(
     dem: Tensor | None = None,
     m2_0: float = 0.0,
     m2_1: float = 0.0,
+    out_dtype: "torch.dtype | None" = None,
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -1114,6 +1130,11 @@ def ffbp_merge2(
     poly_coefs : Tensor, optional
         Precomputed polynomial coefficients.
         Use compute_knab_poly_coefs_full() to compute these for Knab kernels.
+    out_dtype : torch.dtype or None
+        Output image dtype (``torch.complex64`` or ``torch.complex32``);
+        None matches the input dtype. complex32 storage (input or output)
+        is only supported by the polynomial kernel (``use_poly`` with
+        order <= 8).
 
     Returns
     -------
@@ -1123,6 +1144,11 @@ def ffbp_merge2(
     _, order, oversample = parse_interp_method(method, allowed=("knab",))
 
     use_poly = use_poly and order <= 8
+    if not use_poly and (img0.dtype == torch.complex32
+                         or out_dtype == torch.complex32):
+        raise ValueError(
+            "complex32 merge storage requires the polynomial kernel "
+            "(use_poly=True and order <= 8)")
     knab_func = ffbp_merge2_poly if use_poly else ffbp_merge2_knab
     kwargs = dict(
         dem=dem,
@@ -1134,6 +1160,8 @@ def ffbp_merge2(
         m2_0=m2_0,
         m2_1=m2_1,
     )
+    if use_poly:
+        kwargs['out_dtype'] = out_dtype
     if use_poly and poly_coefs is not None:
         kwargs['poly_coefs'] = poly_coefs
     return knab_func(

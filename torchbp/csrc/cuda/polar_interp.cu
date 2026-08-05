@@ -1532,11 +1532,26 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
 }
 
 
+// Single output store of the poly merge kernels with dtype conversion: the
+// fp32-computed pixel is written as complex64 or complex32 (half). A runtime
+// branch is enough here, it runs once per thread, unlike the per-tap input
+// loads whose dtype is a template parameter.
+static __device__ __forceinline__ void ffbp_merge2_store(void *out, int idx,
+        int out_half, complex64_t v) {
+    if (out_half) {
+        ((__half2*)out)[idx] = __floats2half2_rn(v.real(), v.imag());
+    } else {
+        ((complex64_t*)out)[idx] = v;
+    }
+}
+
 // FFBP merge kernel using polynomial approximation for interpolation kernel
 // Uses constant memory d_poly_coefs for polynomial coefficients
-template<int N_COEFS>
-__global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64_t *img1,
-        complex64_t *out, const float *dorigin,
+// Tin is the input image storage type (complex64_t or complex32_t); the
+// interpolation converts taps to fp32 on load, so compute stays fp32.
+template<int N_COEFS, class Tin>
+__global__ void ffbp_merge2_kernel_poly(const Tin *img0, const Tin *img1,
+        void *out_v, int out_half, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
         float dtheta1, int Nr1, int Ntheta1, float z1, float m2_0, float m2_1,
@@ -1571,7 +1586,7 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
     complex64_t pixel{};
 
     for (int id=0; id < 2; id++) {
-        const complex64_t *img = id == 0 ? img0 : img1;
+        const Tin *img = id == 0 ? img0 : img1;
         const float dorig0 = dorigin[id * 3 + 0];
         const float dorig1 = dorigin[id * 3 + 1];
         const float rp2 = d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint);
@@ -1590,7 +1605,7 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
             const float rpz = sqrtf(z0*z0 + rp*rp);
             const float nu = ffbp_merge2_range_fmod(
                     id == 0 ? m2_0 : m2_1, rp, tp, rpz, ref_phase, dr[id]);
-            complex64_t v = interp_2d_poly_fmod<complex64_t, complex64_t, N_COEFS>(
+            complex64_t v = interp_2d_poly_fmod<complex64_t, Tin, N_COEFS>(
                     img, Nr[id], Ntheta[id], dri, dti, order, nu);
 
             float ref_sin, ref_cos;
@@ -1611,7 +1626,7 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
         complex64_t ref = {ref_cos, ref_sin};
         pixel *= ref;
     }
-    out[idr*Ntheta1 + idtheta] = pixel;
+    ffbp_merge2_store(out_v, idr*Ntheta1 + idtheta, out_half, pixel);
 }
 
 
@@ -1622,10 +1637,10 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
 //   A_total = A0 + A1 (sum unnormalized accumulations)
 //   merged = A_total * (W1_total / W2_total) (normalize only at final output)
 // Output weight maps can be decimated to save VRAM (write every D-th pixel)
-template<int N_COEFS>
+template<int N_COEFS, class Tin>
 __global__ void ffbp_merge2_kernel_poly_weighted(
-        const complex64_t *img0, const complex64_t *img1,
-        complex64_t *out,
+        const Tin *img0, const Tin *img1,
+        void *out_v, int out_half,
         float *w1_out,  // Output W1 map (sum of w1 contributions), can be null
         float *w2_out,  // Output W2 map (sum of w2 contributions), can be null
         const float *dorigin,
@@ -1697,7 +1712,7 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
 
     #pragma unroll
     for (int id=0; id < 2; id++) {
-        const complex64_t *img = id == 0 ? img0 : img1;
+        const Tin *img = id == 0 ? img0 : img1;
         const float dorig0 = __ldg(&dorigin[id * 3 + 0]);
         const float dorig1 = __ldg(&dorigin[id * 3 + 1]);
         const float dorig2 = __ldg(&dorigin[id * 3 + 2]);
@@ -1725,7 +1740,7 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
             const float rpz = hypotf(z0, rp);
             const float nu = ffbp_merge2_range_fmod(
                     id == 0 ? m2_0 : m2_1, rp, tp, rpz, ref_phase, dr_val);
-            complex64_t v = interp_2d_poly_fmod<complex64_t, complex64_t, N_COEFS>(
+            complex64_t v = interp_2d_poly_fmod<complex64_t, Tin, N_COEFS>(
                     img, Nr_val, Ntheta_val, dri, dti, order, nu);
 
             float ref_sin, ref_cos;
@@ -1790,7 +1805,7 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
         complex64_t ref = {ref_cos, ref_sin};
         pixel *= ref;
     }
-    out[idr*Ntheta1 + idtheta] = pixel;
+    ffbp_merge2_store(out_v, idr*Ntheta1 + idtheta, out_half, pixel);
 
     // Write decimated weight maps (only every D-th pixel in both dimensions)
     if (should_write_weight) {
@@ -2215,9 +2230,16 @@ at::Tensor ffbp_merge2_poly_cuda(
           double alias_fmod,
           const at::Tensor &dem,
           double m2_0,
-          double m2_1) {
-	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
-	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+          double m2_1,
+          std::optional<at::ScalarType> out_dtype) {
+	TORCH_CHECK(img0.scalar_type() == at::kComplexFloat
+		|| img0.scalar_type() == at::kComplexHalf,
+		"ffbp_merge2_poly: img dtype must be complex64 or complex32");
+	TORCH_CHECK(img1.scalar_type() == img0.scalar_type(),
+		"ffbp_merge2_poly: img0 and img1 dtypes must match");
+	const at::ScalarType out_st = out_dtype.value_or(img0.scalar_type());
+	TORCH_CHECK(out_st == at::kComplexFloat || out_st == at::kComplexHalf,
+		"ffbp_merge2_poly: out_dtype must be complex64 or complex32");
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
 	TORCH_CHECK(r0.dtype() == at::kFloat);
 	TORCH_CHECK(dr0.dtype() == at::kFloat);
@@ -2250,11 +2272,13 @@ at::Tensor ffbp_merge2_poly_cuda(
 	at::Tensor dtheta0_contig = dtheta0.contiguous();
 	at::Tensor Nr0_contig = Nr0.contiguous();
 	at::Tensor Ntheta0_contig = Ntheta0.contiguous();
-	at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+	at::Tensor out = torch::empty({Nr1, Ntheta1},
+		img0_contig.options().dtype(out_st));
+	const int out_half = out_st == at::kComplexHalf ? 1 : 0;
 	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
-    c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
-    c10::complex<float>* img1_ptr = img1_contig.data_ptr<c10::complex<float>>();
-    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+    const void* img0_vptr = img0_contig.data_ptr();
+    const void* img1_vptr = img1_contig.data_ptr();
+    void* out_vptr = out.data_ptr();
     const float* r0_ptr = r0_contig.data_ptr<float>();
     const float* dr0_ptr = dr0_contig.data_ptr<float>();
     const float* theta0_ptr = theta0_contig.data_ptr<float>();
@@ -2293,32 +2317,41 @@ at::Tensor ffbp_merge2_poly_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Dispatch to template-specialized kernel based on n_coefs
-    // This enables full compile-time unrolling of polynomial evaluation
-    #define LAUNCH_KERNEL(N) \
-        ffbp_merge2_kernel_poly<N><<<block_count, thread_per_block, 0, stream>>>( \
-            (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
-            (complex64_t*)out_ptr, dorigin_ptr, ref_phase, \
+    // Dispatch to template-specialized kernel based on n_coefs and the input
+    // image storage type. The output dtype is a runtime kernel argument
+    // (single store per thread), so it does not multiply the instantiations.
+    #define LAUNCH_KERNEL(N, TIN) \
+        ffbp_merge2_kernel_poly<N, TIN><<<block_count, thread_per_block, 0, stream>>>( \
+            (const TIN*)img0_vptr, (const TIN*)img1_vptr, \
+            out_vptr, out_half, dorigin_ptr, ref_phase, \
             r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
             r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, \
             (float)m2_0, (float)m2_1, order, alias, alias_fmod/kPI, \
             dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
 
-    switch (n_coefs) {
-        case 4: LAUNCH_KERNEL(4); break;
-        case 5: LAUNCH_KERNEL(5); break;
-        case 6: LAUNCH_KERNEL(6); break;
-        case 7: LAUNCH_KERNEL(7); break;
-        case 8: LAUNCH_KERNEL(8); break;
-        case 9: LAUNCH_KERNEL(9); break;
-        case 10: LAUNCH_KERNEL(10); break;
-        case 11: LAUNCH_KERNEL(11); break;
-        case 12: LAUNCH_KERNEL(12); break;
-        case 13: LAUNCH_KERNEL(13); break;
-        case 14: LAUNCH_KERNEL(14); break;
-        default:
-            TORCH_CHECK(false, "ffbp_merge2_poly: n_coefs must be 4-14, got ", n_coefs);
+    #define DISPATCH_NCOEFS(TIN) \
+    switch (n_coefs) { \
+        case 4: LAUNCH_KERNEL(4, TIN); break; \
+        case 5: LAUNCH_KERNEL(5, TIN); break; \
+        case 6: LAUNCH_KERNEL(6, TIN); break; \
+        case 7: LAUNCH_KERNEL(7, TIN); break; \
+        case 8: LAUNCH_KERNEL(8, TIN); break; \
+        case 9: LAUNCH_KERNEL(9, TIN); break; \
+        case 10: LAUNCH_KERNEL(10, TIN); break; \
+        case 11: LAUNCH_KERNEL(11, TIN); break; \
+        case 12: LAUNCH_KERNEL(12, TIN); break; \
+        case 13: LAUNCH_KERNEL(13, TIN); break; \
+        case 14: LAUNCH_KERNEL(14, TIN); break; \
+        default: \
+            TORCH_CHECK(false, "ffbp_merge2_poly: n_coefs must be 4-14, got ", n_coefs); \
     }
+
+    if (img0.scalar_type() == at::kComplexFloat) {
+        DISPATCH_NCOEFS(complex64_t);
+    } else {
+        DISPATCH_NCOEFS(complex32_t);
+    }
+    #undef DISPATCH_NCOEFS
     #undef LAUNCH_KERNEL
 
 	return out;
@@ -2360,9 +2393,16 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
           int64_t output_weight_decimation,
           const at::Tensor &dem,
           double m2_0,
-          double m2_1) {
-	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
-	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+          double m2_1,
+          std::optional<at::ScalarType> out_dtype) {
+	TORCH_CHECK(img0.scalar_type() == at::kComplexFloat
+		|| img0.scalar_type() == at::kComplexHalf,
+		"ffbp_merge2_poly_weighted: img dtype must be complex64 or complex32");
+	TORCH_CHECK(img1.scalar_type() == img0.scalar_type(),
+		"ffbp_merge2_poly_weighted: img0 and img1 dtypes must match");
+	const at::ScalarType out_st = out_dtype.value_or(img0.scalar_type());
+	TORCH_CHECK(out_st == at::kComplexFloat || out_st == at::kComplexHalf,
+		"ffbp_merge2_poly_weighted: out_dtype must be complex64 or complex32");
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
 	TORCH_CHECK(r0.dtype() == at::kFloat);
 	TORCH_CHECK(dr0.dtype() == at::kFloat);
@@ -2411,11 +2451,13 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
 	at::Tensor dtheta0_contig = dtheta0.contiguous();
 	at::Tensor Nr0_contig = Nr0.contiguous();
 	at::Tensor Ntheta0_contig = Ntheta0.contiguous();
-	at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+	at::Tensor out = torch::empty({Nr1, Ntheta1},
+		img0_contig.options().dtype(out_st));
+	const int out_half = out_st == at::kComplexHalf ? 1 : 0;
 	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
-    c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
-    c10::complex<float>* img1_ptr = img1_contig.data_ptr<c10::complex<float>>();
-    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+    const void* img0_vptr = img0_contig.data_ptr();
+    const void* img1_vptr = img1_contig.data_ptr();
+    void* out_vptr = out.data_ptr();
     const float* r0_ptr = r0_contig.data_ptr<float>();
     const float* dr0_ptr = dr0_contig.data_ptr<float>();
     const float* theta0_ptr = theta0_contig.data_ptr<float>();
@@ -2489,10 +2531,10 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     int dec = output_weight_decimation > 0 ? output_weight_decimation : 1;
-    #define LAUNCH_WEIGHTED_KERNEL(N) \
-        ffbp_merge2_kernel_poly_weighted<N><<<block_count, thread_per_block, 0, stream>>>( \
-            (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
-            (complex64_t*)out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
+    #define LAUNCH_WEIGHTED_KERNEL(N, TIN) \
+        ffbp_merge2_kernel_poly_weighted<N, TIN><<<block_count, thread_per_block, 0, stream>>>( \
+            (const TIN*)img0_vptr, (const TIN*)img1_vptr, \
+            out_vptr, out_half, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
             r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
             r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, \
             (float)m2_0, (float)m2_1, order, alias, alias_fmod/kPI, \
@@ -2501,21 +2543,29 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
             dec, \
             dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
 
-    switch (n_coefs) {
-        case 4: LAUNCH_WEIGHTED_KERNEL(4); break;
-        case 5: LAUNCH_WEIGHTED_KERNEL(5); break;
-        case 6: LAUNCH_WEIGHTED_KERNEL(6); break;
-        case 7: LAUNCH_WEIGHTED_KERNEL(7); break;
-        case 8: LAUNCH_WEIGHTED_KERNEL(8); break;
-        case 9: LAUNCH_WEIGHTED_KERNEL(9); break;
-        case 10: LAUNCH_WEIGHTED_KERNEL(10); break;
-        case 11: LAUNCH_WEIGHTED_KERNEL(11); break;
-        case 12: LAUNCH_WEIGHTED_KERNEL(12); break;
-        case 13: LAUNCH_WEIGHTED_KERNEL(13); break;
-        case 14: LAUNCH_WEIGHTED_KERNEL(14); break;
-        default:
-            TORCH_CHECK(false, "ffbp_merge2_poly_weighted: n_coefs must be 4-14, got ", n_coefs);
+    #define DISPATCH_WEIGHTED_NCOEFS(TIN) \
+    switch (n_coefs) { \
+        case 4: LAUNCH_WEIGHTED_KERNEL(4, TIN); break; \
+        case 5: LAUNCH_WEIGHTED_KERNEL(5, TIN); break; \
+        case 6: LAUNCH_WEIGHTED_KERNEL(6, TIN); break; \
+        case 7: LAUNCH_WEIGHTED_KERNEL(7, TIN); break; \
+        case 8: LAUNCH_WEIGHTED_KERNEL(8, TIN); break; \
+        case 9: LAUNCH_WEIGHTED_KERNEL(9, TIN); break; \
+        case 10: LAUNCH_WEIGHTED_KERNEL(10, TIN); break; \
+        case 11: LAUNCH_WEIGHTED_KERNEL(11, TIN); break; \
+        case 12: LAUNCH_WEIGHTED_KERNEL(12, TIN); break; \
+        case 13: LAUNCH_WEIGHTED_KERNEL(13, TIN); break; \
+        case 14: LAUNCH_WEIGHTED_KERNEL(14, TIN); break; \
+        default: \
+            TORCH_CHECK(false, "ffbp_merge2_poly_weighted: n_coefs must be 4-14, got ", n_coefs); \
     }
+
+    if (img0.scalar_type() == at::kComplexFloat) {
+        DISPATCH_WEIGHTED_NCOEFS(complex64_t);
+    } else {
+        DISPATCH_WEIGHTED_NCOEFS(complex32_t);
+    }
+    #undef DISPATCH_WEIGHTED_NCOEFS
     #undef LAUNCH_WEIGHTED_KERNEL
 
 	std::vector<at::Tensor> ret;
