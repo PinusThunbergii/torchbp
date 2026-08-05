@@ -132,6 +132,7 @@ def _weighted_normalize(
     w2: Tensor,
     eps: float | None = None,
     rel_floor: float = 1e-3,
+    dec: int | None = None,
 ) -> Tensor:
     """
     Regularized (Wiener) normalization of antenna-pattern-weighted FFBP.
@@ -158,7 +159,10 @@ def _weighted_normalize(
     row chunks so that decimated weight maps are never materialized at full
     image resolution (memory saving is the reason to decimate them in the
     first place). Decimated maps are interpolated at the kernels' sample
-    positions ``dec * i`` (not cell centers).
+    positions ``dec * i`` (not cell centers). Pass the actual map decimation
+    as ``dec``: inferring it from the shapes alone is ambiguous (several
+    decimations can share one ``ceil(n / dec)``), which would shift the
+    interpolation positions. If None it is inferred as ``ceil(n / n_w)``.
     """
     # Linear interpolation cannot exceed the sample max, so the decimated
     # max equals the upsampled max.
@@ -171,8 +175,12 @@ def _weighted_normalize(
     nr, ntheta = A.shape[-2], A.shape[-1]
     nr_w, ntheta_w = w1.shape[-2], w1.shape[-1]
     full_res = nr_w == nr and ntheta_w == ntheta
-    dec_r = -(-nr // nr_w)      # ceil, inverse of out = ceil(n / dec)
-    dec_t = -(-ntheta // ntheta_w)
+    if dec is not None:
+        dec_r = dec
+        dec_t = dec
+    else:
+        dec_r = -(-nr // nr_w)      # ceil, inverse of out = ceil(n / dec)
+        dec_t = -(-ntheta // ntheta_w)
 
     if not full_res:
         # Theta-axis sample positions, shared by all chunks.
@@ -571,7 +579,8 @@ def ffbp(
     # With it the Wiener normalization is applied here
     img = result[0]
     if use_antenna_pattern:
-        img = _weighted_normalize(img, result[1], result[2], eps=weight_eps)
+        img = _weighted_normalize(img, result[1], result[2], eps=weight_eps,
+                                  dec=weight_map_downsample)
     return img
 
 
@@ -1256,10 +1265,11 @@ def _ffbp_impl(
         if use_antenna_pattern and w1_map1 is not None and w2_map1 is not None:
             # Carry the unnormalized accumulation A and the illumination moments
             # W1, W2 up the tree. Wiener normalization is applied once in
-            # ffbp(). The top-level final merge emits full-resolution weight maps
-            # (decimation 1) so that normalization is exact per pixel.
-            final_top = is_top_level and is_final_merge
-            out_dec = 1 if final_top else weight_map_downsample
+            # ffbp(), which upsamples decimated maps in chunks, so the
+            # top-level final merge keeps the same decimation as the rest of
+            # the tree instead of materializing full-resolution maps at the
+            # peak-memory moment.
+            out_dec = weight_map_downsample
 
             img_sum, w1_out, w2_out, merged_weight_grid = ffbp_merge2_poly_weighted(
                 i1,
@@ -1371,10 +1381,12 @@ def _ffbp_impl(
         top[2][:nf_band_nr, :] = nf_band_img
         nf_band_img = None
         if use_antenna_pattern and top[4] is not None and nf_band_w1 is not None:
-            # Top-level final merge emits full-resolution weight maps, and
-            # so do the band partials (same is_final_merge path).
-            top[4][:nf_band_nr, :] = nf_band_w1
-            top[5][:nf_band_nr, :] = nf_band_w2
+            # The band partials share the top maps' decimation and r/theta
+            # start (band_grid keeps the grid r0 and theta extent), so band
+            # map row i samples the same full-grid row dec * i as top map
+            # row i; overwrite by the band map's own row count.
+            top[4][:nf_band_w1.shape[-2], :] = nf_band_w1
+            top[5][:nf_band_w2.shape[-2], :] = nf_band_w2
         nf_band_w1 = None
         nf_band_w2 = None
 
