@@ -101,7 +101,7 @@ at::Tensor resample_2d_knab_cpu(
 
     // Knab window parameter: v = 1 - 1/oversample
     const float v = 1.0f - 1.0f / static_cast<float>(oversample);
-    const float norm = knab_kernel_norm_cpu(order, v);
+    const float norm = knab_kernel_norm(order, v);
 
     if (img.dtype() == at::kComplexFloat) {
         auto interp = [Nr, Naz, order, v, norm](const complex64_t* base, float x, float y) {
@@ -192,7 +192,7 @@ at::Tensor resample_1d_knab_cpu(
 
     // Knab window parameter: v = 1 - 1/oversample
     const float v = 1.0f - 1.0f / static_cast<float>(oversample);
-    const float norm = knab_kernel_norm_cpu(order, v);
+    const float norm = knab_kernel_norm(order, v);
     const float cutoff = M >= N ? 1.0f : (float)M / (float)N;
 
     if (img.dtype() == at::kComplexFloat) {

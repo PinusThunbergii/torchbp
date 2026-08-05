@@ -25,8 +25,8 @@
 #  include "std_complex.h"
 #endif
 
-#define kPI 3.1415926535897932384626433f
-#define kC0 299792458.0f
+#include "../util_shared.h"
+
 #define WARP_SIZE 32
 #define FULL_MASK 0xffffffff
 
@@ -76,186 +76,9 @@ __device__ static inline float fast_atan2f(float y, float x) {
     return copysignf(a, y);
 }
 
-template<class T>
-__device__ T interp2d(const T *img, int nx, int ny,
-        int x_int, float x_frac, int y_int, float y_frac) {
-    return img[x_int*ny + y_int]*(1.0f-x_frac)*(1.0f-y_frac) +
-           img[x_int*ny + y_int+1]*(1.0f-x_frac)*y_frac +
-           img[(x_int+1)*ny + y_int]*x_frac*(1.0f-y_frac) +
-           img[(x_int+1)*ny + y_int+1]*x_frac*y_frac;
-}
-
-template<class T>
-__device__ T interp2d_gradx(const T *img, int nx, int ny,
-        int x_int, float x_frac, int y_int, float y_frac) {
-    return -img[x_int*ny + y_int]*(1.0f-y_frac) +
-           -img[x_int*ny + y_int+1]*y_frac +
-           img[(x_int+1)*ny + y_int]*(1.0f-y_frac) +
-           img[(x_int+1)*ny + y_int+1]*y_frac;
-}
-
-template<class T>
-__device__ T interp2d_grady(const T *img, int nx, int ny,
-        int x_int, float x_frac, int y_int, float y_frac) {
-    return -img[x_int*ny + y_int]*(1.0f-x_frac) +
-           img[x_int*ny + y_int+1]*(1.0f-x_frac) +
-           -img[(x_int+1)*ny + y_int]*x_frac +
-           img[(x_int+1)*ny + y_int+1]*x_frac;
-}
-
-// Shared tx_power helpers (CUDA). Mirror of cpu/util.h; see there for docs.
-__device__ static inline void tx_power_dem_sample(const float* dem, int dem_nr,
-        int dem_ntheta, float fr, float ft,
-        float* z, float* dzdx, float* dzdy) {
-    int ir0 = (int)fr;
-    ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
-    const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
-    const float wr = fr - ir0;
-    int it0 = (int)ft;
-    it0 = it0 < dem_ntheta - 1 ? it0 : dem_ntheta - 1;
-    const int it1 = it0 + 1 < dem_ntheta ? it0 + 1 : dem_ntheta - 1;
-    const float wt = ft - it0;
-    const size_t np = (size_t)dem_nr * dem_ntheta;
-    float out[3];
-    for (int c = 0; c < 3; c++) {
-        const float* row0 = dem + c * np + (size_t)ir0 * dem_ntheta;
-        const float* row1 = dem + c * np + (size_t)ir1 * dem_ntheta;
-        const float a = __ldg(&row0[it0])
-                + wt * (__ldg(&row0[it1]) - __ldg(&row0[it0]));
-        const float b = __ldg(&row1[it0])
-                + wt * (__ldg(&row1[it1]) - __ldg(&row1[it0]));
-        out[c] = a + wr * (b - a);
-    }
-    *z = out[0]; *dzdx = out[1]; *dzdy = out[2];
-}
-
-template<bool HasDem = false>
-__device__ static inline void tx_power_pixel_moments(
-        float px_base, float py_base, bool use_h_fixed, float h_fixed,
-        float z_base, float dzdx, float dzdy,
-        const float* pos, const float* att, int nsweeps,
-        const float* g, float g_az0, float g_el0, float g_daz, float g_del,
-        int g_naz, int g_nel, const float* wa, int normalization,
-        float min_sin2,
-        float* pixel, float* m_w, float* m_mean, float* m_s) {
-    float acc = 0.0f, mw = 0.0f, mmean = 0.0f, ms = 0.0f;
-    float inv_N = 1.0f, sin_floor = 0.0f;
-    if constexpr (HasDem) {
-        inv_N = 1.0f / sqrtf(1.0f + dzdx*dzdx + dzdy*dzdy);
-        sin_floor = sqrtf(min_sin2);
-    }
-    for (int i = 0; i < nsweeps; i++) {
-        const float px = px_base - pos[i*3 + 0];
-        const float py = py_base - pos[i*3 + 1];
-        float h = use_h_fixed ? h_fixed : pos[i*3 + 2];
-        if constexpr (HasDem) h -= z_base;
-        const float d = sqrtf(px*px + py*py + h*h);
-        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
-        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
-        float el_a = look_angle - att[3*i + 0];
-        float az_a = psi - att[3*i + 2];
-        const float pitch = att[3*i + 1];
-        if (pitch != 0.0f) {
-            // Pitch rotates the antenna about its boresight (the along-track
-            // attitude angle for a side-looking antenna). Rotate the
-            // roll/yaw-compensated LOS about the pattern x axis with the full
-            // spherical rotation (x = cos(el)cos(az), y = cos(el)sin(az),
-            // z = sin(el)), matching a pattern rotated by the same angle
-            // about [1, 0, 0]. Zero pitch takes the exact legacy path.
-            const float ce = cosf(el_a);
-            const float ux = ce * cosf(az_a);
-            const float uy = ce * sinf(az_a);
-            const float uz = sinf(el_a);
-            const float cp = cosf(pitch);
-            const float sp = sinf(pitch);
-            const float uyp = cp * uy - sp * uz;
-            const float uzp = sp * uy + cp * uz;
-            el_a = asinf(fmaxf(-1.0f, fminf(1.0f, uzp)));
-            az_a = atan2f(uyp, ux);
-        }
-        const float el_idx = (el_a - g_el0) / g_del;
-        const float az_idx = (az_a - g_az0) / g_daz;
-        const int el_int = el_idx;
-        const int az_int = az_idx;
-        // Reject samples below the pattern's first row/column (negative
-        // fractional index) rather than extrapolating gain below the edge.
-        if (el_idx < 0.0f || el_int + 1 >= g_nel) continue;
-        if (az_idx < 0.0f || az_int + 1 >= g_naz) continue;
-        const float g_i = interp2d<float>(g, g_nel, g_naz,
-                el_int, el_idx - el_int, az_int, az_idx - az_int);
-        float sinl = 1.0f;
-        if constexpr (HasDem) {
-            if (normalization == 1 || normalization == 2) {
-                const float Rg2 = px*px + py*py;
-                const float Rg = fmaxf(sqrtf(Rg2), 1e-6f);
-                const float s = px*dzdx + py*dzdy;
-                if (normalization == 1) {           // sigma_0
-                    sinl = fmaxf(sin_floor, (Rg2 - s*h) * inv_N / (Rg * d));
-                } else {                            // gamma_0
-                    // cos(local incidence) = (s + h) / (d * N) goes to zero
-                    // at grazing and negative in shadow. Clamp it at a small
-                    // positive value so the shadowed contribution rolls
-                    // continuously to (nearly) zero instead of jumping; the
-                    // discontinuity would break the factorized (ffbp)
-                    // interpolation at the shadow boundary.
-                    const float floor_g = sin_floor * d / fmaxf(h, 1e-3f);
-                    const float den = Rg * fmaxf(s + h, 1e-3f * d);
-                    sinl = fmaxf(floor_g, (Rg2 - s*h) / den);
-                }
-            } else if (normalization == 3) {        // point (d^4)
-                sinl = d;
-            }
-        } else {
-            if (normalization == 1) {           // sigma_0
-                sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d)));
-            } else if (normalization == 2) {    // gamma_0
-                sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d))) * d / h;
-            } else if (normalization == 3) {    // point (d^4)
-                sinl = d;
-            }
-        }
-        const float w = wa[i];
-        const float wi = g_i * g_i * w * w / (d*d*d);
-        acc += wi / sinl;
-        if (wi > 0.0f) {
-            const float wsum = mw + wi;
-            const float delta = psi - mmean;
-            mmean += delta * wi / wsum;
-            ms += wi * delta * (psi - mmean);
-            mw = wsum;
-        }
-    }
-    *pixel = acc; *m_w = mw; *m_mean = mmean; *m_s = ms;
-}
-
-__device__ static inline void tx_power_merge_sample(const float* acc, int nx, int ny,
-        int xi, float xf, int yi, float yf,
-        float* S, float* W, float* P1, float* M2) {
-    const size_t np = (size_t)nx * ny;
-    const float w = interp2d<float>(&acc[1*np], nx, ny, xi, xf, yi, yf);
-    if (w <= 0.0f) return;
-    const float s  = interp2d<float>(&acc[0*np], nx, ny, xi, xf, yi, yf);
-    const float p1 = interp2d<float>(&acc[2*np], nx, ny, xi, xf, yi, yf);
-    const float m2 = interp2d<float>(&acc[3*np], nx, ny, xi, xf, yi, yf);
-    if (*W > 0.0f) {
-        const float delta = *P1 / *W - p1 / w;
-        *M2 += m2 + delta * delta * (*W) * w / (*W + w);
-    } else {
-        *M2 += m2;
-    }
-    *S += s; *W += w; *P1 += p1;
-}
-
-inline __device__ float lanczos_kernel(float x, float a) {
-    // Ensured by calling code
-    //if (fabsf(x) >= a) {
-    //    return 0.0f;
-    //}
-    if (x == 0.0f) {
-        return 1.0f;
-    }
-    return sinpif(x) / (kPI * x) * sinpif(x/a) / (kPI * x / a);
-}
+// interp2d, interp2d_grad{x,y}, tx_power_* helpers, lanczos_kernel,
+// knab_kernel and knab_kernel_norm are shared with the CPU backend in
+// ../util_shared.h.
 
 template<class T, class T2>
 __device__ T lanczos_interp_1d(const T2 *img, int n, float pos, int order) {
@@ -291,24 +114,6 @@ __device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, float y, 
         sum += wx * row_val;
     }
     return sum;
-}
-
-inline __host__ __device__ float knab_kernel_norm(int order, float v) {
-    float a = 0.5f * order;
-    return expf(-2.0f*a*kPI*v);
-}
-
-inline __device__ float knab_kernel(float x, float a, float v, float norm) {
-    // This is needed due to rounding errors.
-    if (fabsf(x) >= a) {
-        return 0.0f;
-    }
-    if (x == 0.0f) {
-        return 1.0f;
-    }
-    float xa = x / a;
-    float n = expf(kPI * a * v * (sqrtf(1.0f - xa*xa) - 1.0f));
-    return (sinpif(x) / (kPI * x)) * (norm/(n*(norm + 1.0f)) + n/(norm + 1.0f));
 }
 
 template<class T, class T2>

@@ -1528,7 +1528,7 @@ static void ffbp_merge2_kernel_knab_cpu(const complex64_t *img0, const complex64
         int order, float knab_v, int alias,
         float alias_fmod, const float *dem, float dem_r_scale,
         float dem_theta_scale, int dem_nr, int dem_ntheta, int idr, int tb) {
-    const float knab_norm = knab_kernel_norm_cpu(order, knab_v);
+    const float knab_norm = knab_kernel_norm(order, knab_v);
     ffbp_merge2_kernel_cpu(img0, img1, out, dorigin, ref_phase, r0, dr, theta0,
             dtheta, Nr, Ntheta, r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1,
             m2_0, m2_1,
@@ -2455,11 +2455,11 @@ static void cart_to_polar_kernel_lanczos_cpu(const T *img, T *out,
             const int ny_count = std::min(end_y - start_y + 1, INTERP_MAX_TAPS);
             float wy[INTERP_MAX_TAPS];
             for (int j = 0; j < ny_count; j++) {
-                wy[j] = lanczos_kernel_cpu(yi - (start_y + j), a);
+                wy[j] = lanczos_kernel(yi - (start_y + j), a);
             }
             complex64_t sum = {0.0f, 0.0f};
             for (int i = start_x; i <= end_x; i++) {
-                const float wx = lanczos_kernel_cpu(xi - i, a);
+                const float wx = lanczos_kernel(xi - i, a);
                 const float xk = x0 + dx * i;
                 const float xk2 = (xk-orig0)*(xk-orig0);
                 const complex64_t *row = &img[idbatch * Nx * Ny + i*Ny + start_y];
