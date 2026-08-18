@@ -17,12 +17,11 @@
 #include <tuple>
 #include <omp.h>
 
-#include "../util_shared.h"
-
 namespace torchbp {
 
-using complex64_t = c10::complex<float>;
-
+// Define mixed float * c10::complex<double> multiplication. c10 only provides
+// complex<T> * T.
+// These have to be declared before ../util_shared.h is included.
 inline c10::complex<double> operator * (const float &a, const c10::complex<double> &b){
     return c10::complex<double>(b.real() * (double)a, b.imag() * (double)a);
 }
@@ -30,6 +29,14 @@ inline c10::complex<double> operator * (const float &a, const c10::complex<doubl
 inline c10::complex<double> operator * (const c10::complex<double> &b, const float &a){
     return c10::complex<double>(b.real() * (double)a, b.imag() * (double)a);
 }
+
+}
+
+#include "../util_shared.h"
+
+namespace torchbp {
+
+using complex64_t = c10::complex<float>;
 
 // Branchless float asin (cephes single-precision coefficients), a few ulp
 // from libm asinf. No calls or branches, so it vectorizes when inlined into
