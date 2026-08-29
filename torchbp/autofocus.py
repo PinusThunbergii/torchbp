@@ -182,9 +182,11 @@ def pga_estimator(
             )
             c = torch.sum(ga, dim=1, keepdim=True) / n_in
             d = torch.sum(torch.square(ga), dim=1, keepdim=True) / n_in
+        # The denominator is zero for noiseless target. Cap to large value.
         w = (
             torch.nan_to_num(
-                d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d))
+                d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d)),
+                posinf=1e12,
             )
             + eps
         )
@@ -2270,7 +2272,7 @@ def gpga_tde(
                     weight=target_w, weight_gate=beam_gate,
                     weight_norm=target_wn, weight_pair=target_wpair,
                 )
-                block_w = 1 / torch.sum(1 / w)
+                block_w = torch.sum(w)
                 beam_w = None
                 if use_antenna_weight:
                     # Per-sweep illumination of this block: SCR-weighted
