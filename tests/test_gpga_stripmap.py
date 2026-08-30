@@ -34,6 +34,7 @@ from torchbp.autofocus import (
     pga_estimator,
     _antenna_weights,
     _select_targets,
+    _solve_weight_floor,
 )
 from torchbp.util import detrend
 from numpy import hamming
@@ -229,6 +230,88 @@ class TestWeightedPgaEstimator(unittest.TestCase):
             )
 
 
+class TestPgaEstimatorWeightFloor(unittest.TestCase):
+    """Per-target variance floor defuses an over-confident target.
+
+    The wls weight is an amplitude statistic: a target with near-constant
+    amplitude claims near-infinite weight regardless of what its phase
+    actually measures. A single such "liar" (coherent glint, extended
+    scatterer passing the isolation screen) then dictates the weighted
+    phase estimate. The floor caps any single target's influence so the
+    honest majority wins.
+    """
+
+    def _liar_data(self):
+        torch.manual_seed(0)
+        n, nt = 256, 9
+        t = torch.arange(n, dtype=torch.float32)
+        phi_true = 0.5 * torch.sin(2 * torch.pi * 3 * t / n)
+        phi_liar = -1.0 * torch.sin(2 * torch.pi * 1 * t / n)
+        # Honest targets: share the true phase error, moderate SCR.
+        g_h = torch.exp(1j * phi_true)[None, :] * (1 + 0.1 * torch.randn(nt, n))
+        # Liar: near-constant amplitude, unrelated phase.
+        g_l = torch.exp(1j * phi_liar)[None, :] * (
+            1 + 1e-3 * torch.randn(1, n)
+        )
+        g = torch.cat([g_h, g_l]).to(torch.complex64)
+        return g, phi_true, phi_liar
+
+    @staticmethod
+    def _rms_to(phi, ref):
+        d = phi - ref
+        return (d - d.mean()).pow(2).mean().sqrt().item()
+
+    def test_floor_restores_majority_phase(self):
+        g, phi_true, phi_liar = self._liar_data()
+        phi0, w0 = pga_estimator(g, "wls", return_weight=True)
+        # The liar's weight dwarfs the honest targets and hijacks the
+        # estimate.
+        self.assertGreater(w0[-1].item(), 100 * w0[:-1].max().item())
+        self.assertLess(self._rms_to(phi0, phi_liar), 0.01)
+
+        floor = (1.0 / w0[:-1].median()).item()
+        phi1, w1 = pga_estimator(
+            g, "wls", return_weight=True, weight_floor=floor
+        )
+        # No weight can exceed 1/floor, and the estimate follows the
+        # honest majority.
+        self.assertLessEqual(w1.max().item(), 1.0 / floor + 1e-3)
+        self.assertLess(
+            self._rms_to(phi1, phi_true), 0.3 * self._rms_to(phi0, phi_true)
+        )
+        self.assertLess(
+            self._rms_to(phi1, phi_true), self._rms_to(phi1, phi_liar)
+        )
+
+
+class TestSolveWeightFloor(unittest.TestCase):
+    """Dominance-capped variance floor for gpga_tde block weighting."""
+
+    def _dominance(self, raw_w, eps2):
+        W = torch.stack(
+            [torch.sum(1 / (1 / wb + eps2)) for wb in raw_w]
+        )
+        return (torch.max(W) / torch.quantile(W, 0.75)).item()
+
+    def test_balanced_scene_no_floor(self):
+        torch.manual_seed(0)
+        raw_w = [10 + 50 * torch.rand(8) for _ in range(16)]
+        self.assertEqual(_solve_weight_floor(raw_w, 3.0), 0.0)
+
+    def test_liar_block_capped(self):
+        torch.manual_seed(0)
+        raw_w = [10 + 50 * torch.rand(8) for _ in range(16)]
+        raw_w[3] = raw_w[3].clone()
+        raw_w[3][0] = 1e9  # over-confident target
+        self.assertGreater(self._dominance(raw_w, 0.0), 1e5)
+        eps2 = _solve_weight_floor(raw_w, 3.0)
+        self.assertGreater(eps2, 0.0)
+        # The floor enforces the bound without collapsing it to equality
+        # from below (smallest such floor).
+        self.assertLessEqual(self._dominance(raw_w, eps2), 3.0 + 1e-3)
+        self.assertGreater(self._dominance(raw_w, eps2 / 10), 3.0)
+
+
 class TestSelectTargets(unittest.TestCase):
     """Isolation screen rejects azimuth-extended clutter (building wall)."""
 
@@ -305,6 +388,31 @@ class TestStripmapGpga(unittest.TestCase):
         # Focused target peaks should approach the true-position image.
         loss = target_peaks_db(s, img_true) - target_peaks_db(s, img_focus)
         self.assertLess(np.mean(loss), 2.5)
+
+    def test_tde_block_weighting_modes(self):
+        # "floor" and "harmonic" block weighting must focus the honest
+        # stripmap scene about as well as the default "sum".
+        s = make_scene(self.device)
+        rms = s["dx_err"].pow(2).mean().sqrt().item()
+        for mode in ("floor", "harmonic"):
+            img_focus, pos_new = gpga_tde(
+                None, s["data"], s["pos"], s["fc"], s["r_res"],
+                s["grid_polar"], azimuth_divisions=4, range_divisions=2,
+                estimate_z=False, max_iters=8, att=s["att"], g=s["g"],
+                g_extent=s["g_extent"], data_fmod=s["data_fmod"],
+                block_weighting=mode,
+            )
+            self.assertTrue(torch.isfinite(img_focus).all(), mode)
+            self.assertTrue(torch.isfinite(pos_new).all(), mode)
+            resid = residual_rms(s["dx_err"], pos_new[:, 0] - s["pos"][:, 0])
+            self.assertLess(resid, 0.4 * rms, mode)
+
+        with self.assertRaises(ValueError):
+            gpga_tde(
+                None, s["data"], s["pos"], s["fc"], s["r_res"],
+                s["grid_polar"], azimuth_divisions=4, range_divisions=2,
+                block_weighting="bogus",
+            )
 
     def test_gpga_focuses_stripmap(self):
         # Phase-only GPGA with the wls estimator; pd drifts at target

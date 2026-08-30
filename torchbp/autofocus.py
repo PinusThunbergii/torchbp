@@ -81,6 +81,46 @@ def _batched_eigh(
     )
 
 
+def _solve_weight_floor(
+    raw_w: list, dominance: float
+) -> float:
+    """Smallest per-target variance floor bounding block dominance.
+
+    Given each block's raw per-target weights, returns the smallest
+    ``eps2`` such that with floored weights ``1/(1/w + eps2)`` the
+    largest block weight ``sum(w_floored)`` is within ``dominance``
+    times the upper-quartile block weight. Returns 0.0 when the raw
+    weights already satisfy the bound. See :func:`gpga_tde`
+    ``block_weighting="floor"``.
+    """
+    w_cat = torch.cat(raw_w)
+    w_inv = 1 / w_cat
+    seg = torch.repeat_interleave(
+        torch.arange(len(raw_w), device=w_cat.device),
+        torch.tensor([wb.numel() for wb in raw_w], device=w_cat.device),
+    )
+
+    def _dominance(floor_val):
+        bs = torch.zeros(
+            len(raw_w), dtype=w_cat.dtype, device=w_cat.device
+        ).index_add_(0, seg, 1 / (w_inv + floor_val))
+        return (
+            torch.max(bs) / torch.clamp(torch.quantile(bs, 0.75), min=1e-30)
+        ).item()
+
+    if _dominance(0.0) <= dominance:
+        return 0.0
+    # Dominance is monotone in the floor, log-bisect it.
+    lo, hi = 1e-13, 1e6
+    for _ in range(60):
+        mid = (lo * hi) ** 0.5
+        if _dominance(mid) > dominance:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
 def pga_estimator(
     g: Tensor,
     estimator: str = "wls",
@@ -90,6 +130,7 @@ def pga_estimator(
     weight_gate: float = 0.2,
     weight_norm: Tensor | None = None,
     weight_pair: Tensor | None = None,
+    weight_floor: float = 0.0,
 ) -> Union[Tuple[Tensor, Tensor], Tensor]:
     """
     Estimate phase error from set of measurements.
@@ -127,6 +168,14 @@ def pga_estimator(
         Optional precomputed ``weight_norm * shift(weight_norm)`` pair
         product (``wn * pad(wn[..., :-1], (1, 0))``), same reuse purpose.
         Must match ``weight``.
+    weight_floor : float
+        Variance floor added to each target's estimated phase variance in
+        the "wls" weighting: ``w <- 1/(1/w + weight_floor)``. The
+        amplitude-statistics weight can only err upward, a coherent glint or an
+        extended scatterer that passes the target screening can fake
+        amplitude-constancy and claim near-infinite weight, and without a floor
+        a single over-confident target takes over the weighted phase estimate.
+        0 disables the floor.
 
     References
     ----------
@@ -190,6 +239,8 @@ def pga_estimator(
             )
             + eps
         )
+        if weight_floor > 0:
+            w = 1 / (1 / w + weight_floor)
         # Pairwise products on views; the first product (against the
         # zero-padded sample) is identically zero, so only pad phidot.
         prod = g[..., 1:] * torch.conj(g[..., :-1])
@@ -1961,7 +2012,9 @@ def gpga_tde(
     eps: float = 1e-6,
     interp_method: str = "linear",
     estimate_z: bool = True,
-    solve_threshold: float = 3e-3,
+    solve_threshold: float = 1e-2,
+    block_weighting: str = "floor",
+    weight_floor_dominance: float = 3.0,
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
@@ -2077,6 +2130,36 @@ def gpga_tde(
         broadside with a narrow beam) accumulate noise; lower it if a
         weakly observed direction that should be estimated is being
         suppressed.
+    block_weighting : str
+        How a block's per-target "wls" weights combine into the block's
+        weight in the per-sweep position solve:
+            - "sum": arithmetic sum. Correct inverse-variance weighting
+              when the weights are exact and target errors are
+              clutter-limited and independent, sensitive to a single
+              over-confident target (coherent glint, extended scatterer
+              passing the isolation screen).
+            - "harmonic": ``1/sum(1/w)``. Dominated by the block's
+              weakest target: robust to over-confident targets, but
+              penalizes a block for having many targets.
+            - "floor": per-target variance floor, then sum:
+              ``sum(1/(1/w + eps2))``. Robust to over-confident targets
+              while still crediting a block for multiple good targets.
+              ``eps2`` is the smallest floor that keeps the largest block
+              weight within ``weight_floor_dominance`` times the
+              upper-quartile block weight (0 when the scene is already
+              balanced, making it identical to "sum"), and, lagged by one
+              iteration, also floors the weights inside the per-block
+              phase estimate (:func:`pga_estimator` ``weight_floor``) so
+              a single target cannot dictate the block phase,
+              illumination weighting or block center either.
+    weight_floor_dominance : float
+        Maximum allowed ratio of the largest block weight to the
+        upper-quartile block weight with ``block_weighting="floor"``.
+        The variance floor is the smallest value that enforces it, so on
+        a balanced scene the floor is zero and "floor" is identical to
+        "sum". It only intervenes when a few blocks claim far more
+        information than the rest, which is the winner-take-all failure
+        the floor exists to prevent.
     att : Tensor
         Antenna rotation tensor.
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
@@ -2141,6 +2224,12 @@ def gpga_tde(
     # regular tensors.
     data = data.resolve_conj()
 
+    if block_weighting not in ("sum", "harmonic", "floor"):
+        raise ValueError(f"Unknown block_weighting {block_weighting}")
+    # Per-target variance floor for block_weighting="floor". 0 until the
+    # first iteration's raw weights set the scale.
+    weight_floor = 0.0
+
     form_image = _make_image_former(
         algorithm, grid, data, fc, r_res, d0, data_fmod,
         att, g, g_extent, image_opts, dem,
@@ -2200,6 +2289,8 @@ def gpga_tde(
         print("Iteration, Window width, RMS error")
 
     for i in range(max_iters):
+        floor_w = []
+        floor_idx = []
         lp_w = fft_lowpass_filter_precalculate_window(
             pos_new.shape[0], window_width, img.device, lowpass_window, fast_len=True
         )
@@ -2271,8 +2362,17 @@ def gpga_tde(
                     target_data, "wls", eps, return_weight=True,
                     weight=target_w, weight_gate=beam_gate,
                     weight_norm=target_wn, weight_pair=target_wpair,
+                    weight_floor=weight_floor,
                 )
-                block_w = torch.sum(w)
+                if block_weighting == "harmonic":
+                    block_w = 1 / torch.sum(1 / w)
+                else:
+                    # "sum", and "floor" (w comes floored from
+                    # pga_estimator once weight_floor is set).
+                    block_w = torch.sum(w)
+                if block_weighting == "floor":
+                    floor_w.append(w[:, 0])
+                    floor_idx.append(ir * azimuth_divisions + jr)
                 beam_w = None
                 if use_antenna_weight:
                     # Per-sweep illumination of this block: SCR-weighted
@@ -2296,6 +2396,36 @@ def gpga_tde(
                 local_centers[ir * azimuth_divisions + jr] = torch.sum(
                     wn[:, None] * target_pos, dim=0
                 ) / torch.sum(wn)
+
+        if block_weighting == "floor" and len(floor_w) > 0:
+            # Solve for the smallest per-target variance floor that keeps
+            # the largest block weight within weight_floor_dominance times
+            # the upper-quartile block weight. On a balanced scene the
+            # floor stays zero and "floor" degenerates to "sum". It binds
+            # only when a few blocks claim far more information than the
+            # rest, the winner-take-all failure this mode prevents.
+            if weight_floor > 0:
+                # Weights came floored from pga_estimator, invert the
+                # (monotone) floor element-wise to get raw weights.
+                raw_w = [
+                    1 / torch.clamp(1 / wb - weight_floor, min=1e-12)
+                    for wb in floor_w
+                ]
+            else:
+                raw_w = floor_w
+            new_floor = _solve_weight_floor(raw_w, weight_floor_dominance)
+            if weight_floor == 0.0 and new_floor > 0.0:
+                # This iteration ran with raw weights, refloor the block
+                # weights before the position solve so over-confident
+                # targets cannot dominate it.
+                for bi, w_blk in zip(floor_idx, raw_w):
+                    scale = torch.sum(1 / (1 / w_blk + new_floor)) / torch.sum(
+                        w_blk
+                    )
+                    local_w[bi, :] *= scale
+            weight_floor = new_floor
+            if verbose:
+                print(f"weight floor: {weight_floor:.3g}")
 
         # Local image centers in Cartesian world coordinates
         local_x = local_centers[:, 0]
