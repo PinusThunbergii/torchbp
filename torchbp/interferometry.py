@@ -87,7 +87,7 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
     return filtered
 
 
-def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Tensor, fc: float) -> Tensor:
+def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Tensor, fc: float, model: str = "layover") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -103,6 +103,13 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
         3D antenna phase center location of the slave image.
     fc : float
         RF center frequency in Hz.
+    model : str
+        Height-sensitivity model. ``"layover"`` (default): the scatterer
+        imaged at a ground-plane pixel is the one whose master range equals
+        the pixel's.
+        ``"point"``: the point-phase-center form (z2/r2 - z1/r1), which assumes
+        the scatterer sits directly above the pixel. Not as accurate with
+        layover.
 
     Returns
     -------
@@ -119,15 +126,25 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
     r1 = torch.linalg.norm(v1, dim=0)
     r2 = torch.linalg.norm(v2, dim=0)
 
-    # First-order height sensitivity for flat imaging plane:
-    #   dphi/dh = (4pi/lambda) · (origin2_z/r2 − origin1_z/r1)
-    sensitivity = origin2[2] / r2 - origin1[2] / r1
+    if model == "layover":
+        # x: cross-track ground distance from the master track.
+        x = v1[0]
+        x = torch.where(x.abs() < 1.0, torch.sign(x) * 1.0 + (x == 0) * 1.0, x)
+        bx = origin2[0] - origin1[0]
+        sensitivity = ((origin2[2] - coords[2])
+                       - (origin1[2] - coords[2]) * (x - bx) / x) / r2
+    elif model == "point":
+        # First-order height sensitivity for flat imaging plane:
+        #   dphi/dh = (4pi/lambda) * (origin2_z/r2 − origin1_z/r1)
+        sensitivity = origin2[2] / r2 - origin1[2] / r1
+    else:
+        raise ValueError(f"unknown model {model!r}; use 'layover' or 'point'")
 
     z = -wl * unw / (4 * torch.pi * sensitivity)
     return z
 
 
-def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict") -> Tensor:
+def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict", model: str = "layover") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -143,6 +160,13 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
         RF center frequency in Hz.
     grid : PolarGrid or dict
         Image grid definition. PolarGrid object or dictionary.
+    model : str
+        Height-sensitivity model. ``"layover"`` (default): the scatterer
+        imaged at a ground-plane pixel is the one whose master range equals
+        the pixel's.
+        ``"point"``: the point-phase-center form (z2/r2 - z1/r1), which assumes
+        the scatterer sits directly above the pixel. Not as accurate with
+        layover.
 
     Returns
     -------
@@ -157,10 +181,10 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
     theta = theta0 + dtheta * torch.arange(ntheta, device=device)
     coords = torch.stack([r[:,None] * torch.sqrt(1 - theta**2)[None,:], r[:,None] * theta[None,:], torch.zeros_like(unw)])
 
-    return phase_to_elevation(unw, coords, origin1, origin2, fc)
+    return phase_to_elevation(unw, coords, origin1, origin2, fc, model=model)
 
 
-def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "CartesianGrid | dict") -> Tensor:
+def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "CartesianGrid | dict", model: str = "layover") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -176,6 +200,13 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
         RF center frequency in Hz.
     grid : CartesianGrid or dict
         Image grid definition. CartesianGrid object or dictionary.
+    model : str
+        Height-sensitivity model. ``"layover"`` (default): the scatterer
+        imaged at a ground-plane pixel is the one whose master range equals
+        the pixel's.
+        ``"point"``: the point-phase-center form (z2/r2 - z1/r1), which assumes
+        the scatterer sits directly above the pixel. Not as accurate with
+        layover.
 
     Returns
     -------
@@ -192,7 +223,7 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
         dtype=x.dtype)], indexing="ij"))
     coords = coords[..., 0]
 
-    return phase_to_elevation(unw, coords, origin1, origin2, fc)
+    return phase_to_elevation(unw, coords, origin1, origin2, fc, model=model)
 
 
 def flat_earth_phase_polar(origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict") -> Tensor:
