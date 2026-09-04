@@ -2534,6 +2534,7 @@ def insar_rme_blocksvd(
     data_fmod: float = 0.0,
     row_weight: str = "coherence",
     align_blocks: bool = True,
+    align_iters: int = 0,
     aperture_mask: bool = True,
     aperture_pad: float = 1.0,
     phi_lowpass: int = 0,
@@ -2616,6 +2617,20 @@ def insar_rme_blocksvd(
         This absorbs the per-block complex constant ``c_b`` (baseline /
         sub-pixel position) and is essential when topographic phase varies
         across the image.
+    align_iters : int
+        Number of rank-1 power iterations refining the block alignment.
+        The one-shot mean-phase alignment divides each block by the mean
+        phase over its own sweep window, which also removes every error
+        component slower than that window; the window is ``min(track,
+        +-r*tan(beam))`` so near-range blocks lose slow content that
+        far-range blocks keep, and in :func:`insar_rme_blocksvd_strata`
+        the strata differential of that leaks into Z. Iterating
+        ``c_b <- angle(Sum_m conj(v_m) alpha_bm)``,
+        ``v_m <- Sum_b conj(u_b) alpha_bm`` fits the per-block constants
+        and the per-sweep phase jointly (masked rank-1 factorization),
+        which keeps everything except the global constant. 0 (default)
+        keeps the one-shot alignment; ~20 is enough on a well-covered
+        track.
     aperture_mask : bool
         If True (recommended), zero out per-block alpha entries for slave
         sweeps outside the block's synthetic-aperture window.
@@ -2787,7 +2802,16 @@ def insar_rme_blocksvd(
 
     if align_blocks:
         block_phase = torch.angle(A.sum(dim=1, keepdim=True))
-        A_aligned = A * torch.exp(-1j * block_phase)
+        u = torch.exp(1j * block_phase)                          # [nblocks, 1]
+        for _ in range(max(0, int(align_iters))):
+            # Rank-1 power iteration on the masked, weighted alpha
+            # matrix, A[b, m] ~ u_b * v_m. The one-shot alignment above
+            # is its first half-step (v = 1 inside every block window).
+            v = (A * u.conj()).sum(dim=0)                        # [nsweeps]
+            v = v / (v.abs() + 1e-30)
+            u = (A * v.conj()[None, :]).sum(dim=1, keepdim=True)
+            u = u / (u.abs() + 1e-30)
+        A_aligned = A * u.conj()
     else:
         A_aligned = A
 
@@ -2836,12 +2860,16 @@ def insar_rme_blocksvd_strata(
     n_strata: int = 8,
     n_az_blocks_per_strata: int = 32,
     strata_spacing: str = "elevation",
+    align_iters: int = 0,
     estimate_z: bool = False,
+    estimate_y: bool = False,
     d0: float = 0.0,
     data_fmod: float = 0.0,
     phi_lowpass: int = 0,
     delta_lowpass: int = 0,
     z_lowpass: int | None = None,
+    y_lowpass: int | None = None,
+    y_r_max: float | None = None,
     ls_reg: float = 0.3,
     robust_iters: int = 2,
     spatial_coherence: Tensor | None = None,
@@ -2892,9 +2920,27 @@ def insar_rme_blocksvd_strata(
     n_az_blocks_per_strata : int
         Number of azimuth blocks per strata, passed to the per-strata
         :func:`insar_rme_blocksvd` call.
+    align_iters : int
+        Rank-1 power iterations refining each strata's block alignment,
+        see :func:`insar_rme_blocksvd`. With 0 (default) each strata's
+        phase is high-passed at its own block window length, which is
+        range dependent; the inconsistent slow content between strata is
+        then attributed to Z by the least squares. Use ~20 to fit the
+        per-block constants jointly so only the global constant is lost.
     estimate_z : bool
         If True, also solve for Z position error. Requires ``n_strata >= 2`` and
         meaningful elevation-angle diversity across strata.
+    estimate_y : bool
+        If True, also estimate the along-track (Y) position error from the
+        odd-in-aspect part of each strata's block alphas. For sweep ``m``
+        the blocks ahead of it (``y_b > y_m``) and behind it are summed
+        separately; the X/Z phase (even in aspect) and the per-block
+        constants cancel in ``angle(v+ * conj(v-))`` while the Y phase
+        ``-k e_y sin(az) cos(el)`` adds, with the |alpha|-weighted lever
+        ``<sin(az) cos(el)>_+ - <..>_-`` known per sweep. Strata are
+        combined with weight ``|v+| |v-| coh^2``. The estimate is zero-mean
+        (a constant Y error is degenerate with the baseline / a linear Z
+        tilt, leave it to coregistration). Not affected by ``estimate_z``.
     d0, data_fmod, spatial_coherence
         Forwarded to per-strata :func:`insar_rme_blocksvd`.
     phi_lowpass : int
@@ -2908,6 +2954,13 @@ def insar_rme_blocksvd_strata(
     delta_lowpass : int
         If > 0, Hamming-window lowpass after the LS. Useful to suppress LS noise
         on Z when its conditioning is marginal.
+    y_lowpass : int or None
+        Hamming-window lowpass (sweeps) applied to the Y estimate. None
+        (default) uses ``delta_lowpass``; 0 disables.
+    y_r_max : float or None
+        Only strata with centre range <= ``y_r_max`` (m) contribute to the
+        Y estimate. Far strata see the track at small aspect (tiny lever)
+        and are the decorrelated part of the scene; None uses all.
     z_lowpass : int or None
         If > 1, additional Hamming-window lowpass applied to the Z
         correction only. Z is observed through the band-differential of
@@ -2940,7 +2993,7 @@ def insar_rme_blocksvd_strata(
     -------
     pos_s_new : Tensor [nsweeps, 3]
         Corrected slave positions; X is always corrected, Z corrected
-        only when ``estimate_z=True``.
+        only when ``estimate_z=True``, Y only when ``estimate_y=True``.
     delta : Tensor [nsweeps, 3]
         Per-sweep XYZ correction added to ``pos_s``. Non-estimated
         axes are zero.
@@ -2953,6 +3006,17 @@ def insar_rme_blocksvd_strata(
     device = data_s.device
     nsweeps_s = data_s.shape[0]
     n_axes = 1 + int(estimate_z)
+    k_wave = 4.0 * torch.pi * fc / C0
+    if estimate_y:
+        y_num = torch.zeros(nsweeps_s, dtype=torch.float32, device=device)
+        y_den = torch.zeros(nsweeps_s, dtype=torch.float32, device=device)
+        h_y = float(altitude) if altitude is not None else float(
+            pos_s[:, 2].mean().abs().item()
+        )
+        tc_blocks = theta0 + (
+            torch.arange(n_az_blocks_per_strata, device=device,
+                         dtype=torch.float32) + 0.5
+        ) * (theta1 - theta0) / n_az_blocks_per_strata
 
     if img_m.dim() == 3:
         img_m = img_m.squeeze(0)
@@ -3052,17 +3116,47 @@ def insar_rme_blocksvd_strata(
                 (p_img * coh_s ** 2).sum() / (p_img.sum() + 1e-30)
             )
 
-        _pos_s_new, _phi_unused, v_s = insar_rme_blocksvd(
+        _bs = insar_rme_blocksvd(
             data_s, pos_s, img_m[i0:i1, :], fc, r_res, gp_s,
             n_az_blocks=n_az_blocks_per_strata, n_r_blocks=1,
             d0=d0, data_fmod=data_fmod,
             row_weight="coherence", align_blocks=True,
+            align_iters=align_iters,
             aperture_mask=True, aperture_pad=1.0,
             phi_lowpass=0,
             spatial_coherence=coh_s,
+            return_alpha=estimate_y,
             return_complex=True,
             verbose=False,
         )
+        v_s = _bs[-1]
+        if estimate_y and (y_r_max is None or rc <= y_r_max):
+            # Odd-in-aspect (forward minus backward) half-aperture sums of
+            # the aligned block alphas: X/Z and c_b cancel, Y adds.
+            A_s = _bs[2]                                     # [n_az, nsweeps]
+            yb = rc * tc_blocks                              # block along-track pos
+            dy_b = yb[:, None] - pos_s[None, :, 1]           # [n_az, nsweeps]
+            if altitude is not None:
+                lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2)
+            else:
+                lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2 + h_y ** 2)
+            fwd = dy_b > 0
+            bwd = dy_b < 0
+            v_p = (A_s * fwd).sum(dim=0)
+            v_m = (A_s * bwd).sum(dim=0)
+            wa = A_s.abs()
+            lev_p = (wa * fwd * lever).sum(0) / ((wa * fwd).sum(0) + 1e-30)
+            lev_m = (wa * bwd * lever).sum(0) / ((wa * bwd).sum(0) + 1e-30)
+            lev = lev_p - lev_m
+            # phase(v+) - phase(v-) = -k e_y (lev+ - lev-); e_y = assumed - true
+            ey_s = -torch.angle(v_p * v_m.conj()) / (k_wave * lev.clamp(min=1e-3))
+            # Fisher-style weight: phase precision |v+||v-| coh^2 times the
+            # squared lever (far strata see the track at tiny aspect and
+            # would otherwise dominate through their |v| alone).
+            w_y = (v_p.abs() * v_m.abs() * (lev > 0.05) * float(coh_per_strata[s])
+                   * lev ** 2)
+            y_num += w_y * ey_s
+            y_den += w_y
         # Full-band phase with lowpass-referenced unwrap: the lowpassed
         # phase picks the 2*pi branch, the wrapped residual keeps the
         # high-frequency content that a plain lowpass would discard.
@@ -3179,6 +3273,13 @@ def insar_rme_blocksvd_strata(
     delta[:, 0] = sol[:, 0]
     if estimate_z:
         delta[:, 2] = sol[:, 1]
+    if estimate_y:
+        ey = y_num / (y_den + 1e-30)
+        y_lp = delta_lowpass if y_lowpass is None else y_lowpass
+        if y_lp and y_lp > 1:
+            ey = conv_lowpass_filter(ey, y_lp)
+        # ey is (assumed - true); the correction added to pos_s is -ey.
+        delta[:, 1] = -ey
     delta = delta - delta.mean(dim=0, keepdim=True)
 
     if delta_lowpass and delta_lowpass > 1:
@@ -3195,6 +3296,10 @@ def insar_rme_blocksvd_strata(
 
     if verbose:
         rms = [f"X={torch.sqrt(torch.mean(delta[:, 0] ** 2)).item() * 1000:.2f}"]
+        if estimate_y:
+            rms.append(
+                f"Y={torch.sqrt(torch.mean(delta[:, 1] ** 2)).item() * 1000:.2f}"
+            )
         if estimate_z:
             rms.append(
                 f"Z={torch.sqrt(torch.mean(delta[:, 2] ** 2)).item() * 1000:.2f}"
