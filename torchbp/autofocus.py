@@ -3206,6 +3206,98 @@ def insar_rme_blocksvd_strata(
     return pos_s_new, delta
 
 
+def esd_dc_solve(
+    sm_field: dict,
+    sm_ref: dict,
+    probes: list,
+    weight_floor_frac: float = 0.05,
+    verbose: bool = False,
+) -> tuple[Tensor, float]:
+    """
+    Solve constant differential errors from ESD double-difference means.
+
+    The multisquint ``remove_trend`` discards the weighted mean phase step
+    per (range band, azimuth block) because it mixes the deterministic
+    baseline-induced step with unobservable linear error trends and with
+    the ESD DC observable of a constant differential along-track error.
+    This solver separates them by calibration instead of an analytic
+    model: the caller extracts the raw step means (``return_step_means``)
+    from the field image pair, from a reference pair simulated with the
+    assumed geometry (same grid, trajectories and image formation, an
+    on-focus-surface synthetic scene), and from probe pairs re-simulated
+    with a known perturbation (e.g. the slave trajectory shifted by 10 mm
+    along track). The reference captures the deterministic step exactly,
+    including every implementation detail of the image formation, and
+    each probe measures one parameter's lever.
+
+    Small-angle weighted least squares over the (band, block) cells:
+    ``angle(S_field * conj(S_ref)) = sum_i c_i * angle(S_probe_i *
+    conj(S_ref)) / probe_scale_i``. Topographic phase cancels per pixel
+    in the double difference itself, so the reference scene does not need
+    the true terrain. The residual terrain sensitivity is the second-order
+    ``b_y * h`` aspect-rotation term.
+
+    Parameters
+    ----------
+    sm_field, sm_ref : dict
+        Step means from :func:`insar_rme_multisquint`
+        (``return_step_means=True``) of the field and reference pairs.
+        Must come from identical estimator settings (looks, bands, grid).
+    probes : list of (dict, float)
+        Probe step means with the parameter value used in each probe
+        simulation (e.g. ``[(sm_probe_dy, 0.01)]`` for a 10 mm
+        along-track probe). One solved coefficient per probe, in probe
+        parameter units.
+    weight_floor_frac : float
+        Cells with field magnitude below this fraction of the maximum are
+        excluded (decorrelated or unilluminated cells).
+    verbose : bool
+        Print the per-band residual and lever table.
+
+    Returns
+    -------
+    coef : Tensor
+        Solved parameters, one per probe. ``coef[0]`` is the first
+        probe's parameter (e.g. e_y in meters).
+    resid_rms : float
+        Weighted rms of the post-fit step residual (radians).
+    """
+    S_f = sm_field["dd"].sum(dim=-1)
+    S_r = sm_ref["dd"].sum(dim=-1)
+    valid = sm_field["band_valid"] & sm_ref["band_valid"]
+    w = S_f.abs() * (S_r.abs() > 0)
+    w = w * valid[:, None]
+    w = torch.where(w > weight_floor_frac * w.max(), w, torch.zeros_like(w))
+    phi_r = torch.angle(S_f * torch.conj(S_r))
+    cols = []
+    for sm_p, scale in probes:
+        S_p = sm_p["dd"].sum(dim=-1)
+        w = w * (S_p.abs() > 0)
+        cols.append(torch.angle(S_p * torch.conj(S_r)) / scale)
+    A = torch.stack([c.flatten() for c in cols], dim=-1)
+    b = phi_r.flatten()
+    ws = w.flatten()
+    Aw = A * ws.sqrt()[:, None]
+    bw = b * ws.sqrt()
+    coef = torch.linalg.lstsq(Aw, bw.unsqueeze(-1)).solution.squeeze(-1)
+    r = b - A @ coef
+    resid_rms = float(
+        torch.sqrt(torch.sum(ws * r ** 2) / torch.clamp(ws.sum(), min=1e-30))
+    )
+    if verbose:
+        nb = phi_r.shape[0]
+        for bi in range(nb):
+            if not bool(valid[bi]):
+                continue
+            print(
+                f"  band {bi}: rc={float(sm_field['band_rc'][bi]):7.1f} m  "
+                f"step={float((w[bi]*phi_r[bi]).sum()/w[bi].sum().clamp(min=1e-30)):+8.4f} rad  "
+                f"lever0={float((w[bi]*cols[0][bi]).sum()/w[bi].sum().clamp(min=1e-30)):+9.3f} rad/unit"
+            )
+        print(f"  solved: {[f'{float(c):+.6g}' for c in coef]}, resid rms {resid_rms:.4f} rad")
+    return coef, resid_rms
+
+
 def _interp1_linear(xq: Tensor, x: Tensor, y: Tensor) -> Tensor:
     """
     Linear interpolation of `y` sampled at ascending `x`, evaluated at `xq`.
@@ -3252,6 +3344,7 @@ def insar_rme_multisquint(
     remove_trend: bool = True,
     altitude: float | None = None,
     return_phi_bands: bool = False,
+    return_step_means: bool = False,
     verbose: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -3402,6 +3495,18 @@ def insar_rme_multisquint(
     return_phi_bands : bool
         Also return the per-band slant-range error phase interpolated to
         sweeps, shape [n_r_bands, nsweeps].
+    return_step_means : bool
+        Also return a dict with the raw complex double-difference sums
+        before the ``remove_trend`` mean subtraction — the constant step
+        per band that the trend removal discards. This is the ESD (azimuth
+        spectral diversity) DC observable: a constant differential
+        along-track error ``e_y`` produces a constant step
+        ``-k * e_y * dy_step / R_band`` in every look pair, mixed with the
+        deterministic baseline-induced step and any linear error trend.
+        Keys: ``dd`` [n_r_bands, T, ndiff] complex pair sums, ``band_rc``,
+        ``band_valid``, ``dy_step`` (along-track separation of the
+        differenced looks, m). Solve for ``e_y`` against reference
+        simulations with :func:`esd_dc_solve`. From the last iteration.
     verbose : bool
         Print progress.
 
@@ -3548,6 +3653,7 @@ def insar_rme_multisquint(
     img_s_cur = img_s
     S_m = torch.fft.fft(img_m, dim=1)
     phi_bands_swp = None
+    step_means = None
 
     for iteration in range(max_iters):
         S_s = torch.fft.fft(img_s_cur, dim=1)
@@ -3676,6 +3782,14 @@ def insar_rme_multisquint(
         dd_az = dd_bands.sum(dim=1)                              # [nbands, ndiff]
         steps_az = torch.angle(dd_az)
         w_az = dd_az.abs()
+
+        if return_step_means:
+            step_means = {
+                "dd": dd_bands.clone(),
+                "band_rc": band_rc.clone(),
+                "band_valid": band_valid.clone(),
+                "dy_step": float(lag) * dy_look,
+            }
 
         if remove_trend:
             # A constant step per band is a linear trend in the error
@@ -3951,9 +4065,12 @@ def insar_rme_multisquint(
                 dealias=dealias, data_fmod=data_fmod, alias_fmod=alias_fmod,
             )[0]
 
+    out = [pos_s_new, delta]
     if return_phi_bands:
-        return pos_s_new, delta, phi_bands_swp
-    return pos_s_new, delta
+        out.append(phi_bands_swp)
+    if return_step_means:
+        out.append(step_means)
+    return tuple(out)
 
 
 def _get_kwargs() -> dict:
