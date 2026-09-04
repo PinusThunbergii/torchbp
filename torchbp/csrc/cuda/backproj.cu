@@ -623,7 +623,37 @@ struct BlocksvdParams {
     float dtheta;
     float d0;
     float data_fmod;
+    // Optional pixel-height map [dem_nr, dem_ntheta] sharing the grid
+    // extent (pixel index * scale = DEM index, bilinear, edge clamped,
+    // same convention as backprojection_polar_2d). nullptr: z = 0 plane.
+    const float* dem;
+    float dem_r_scale;
+    float dem_theta_scale;
+    int dem_nr;
+    int dem_ntheta;
 };
+
+// Bilinear DEM height at grid pixel (ir, it). Mirrors the sampling in
+// backprojection_polar_2d_kernel so a master image formed on the DEM and
+// the alpha footprint see the same pixel positions.
+__device__ __forceinline__ float blocksvd_dem_z(
+          const BlocksvdParams& p, int ir, int it) {
+    const float fr = ir * p.dem_r_scale;
+    const float ft = it * p.dem_theta_scale;
+    const int ir0 = min((int)fr, p.dem_nr - 1);
+    const int ir1 = min(ir0 + 1, p.dem_nr - 1);
+    const int it0 = min((int)ft, p.dem_ntheta - 1);
+    const int it1 = min(it0 + 1, p.dem_ntheta - 1);
+    const float wr = fr - ir0;
+    const float wt = ft - it0;
+    const float z00 = __ldg(&p.dem[ir0 * p.dem_ntheta + it0]);
+    const float z01 = __ldg(&p.dem[ir0 * p.dem_ntheta + it1]);
+    const float z10 = __ldg(&p.dem[ir1 * p.dem_ntheta + it0]);
+    const float z11 = __ldg(&p.dem[ir1 * p.dem_ntheta + it1]);
+    const float za = fmaf(wt, z01 - z00, z00);
+    const float zb = fmaf(wt, z11 - z10, z10);
+    return fmaf(wr, zb - za, za);
+}
 
 // One pixel's contribution to alpha[b, m]: interpolate the sweep at the
 // pixel's range, demodulate, and accumulate against the conjugated
@@ -634,17 +664,19 @@ __device__ __forceinline__ void blocksvd_accumulate_pixel(
           float r,
           float theta,
           float ct,
+          float z,
           float pos_x,
           float pos_y,
-          float pz2,
+          float pos_z,
           const BlocksvdParams p,
           float* acc_r,
           float* acc_i) {
     const float px = r * ct - pos_x;
     const float py = r * theta - pos_y;
+    const float pz = z - pos_z;
 
-    // Calculate distance to the pixel.
-    const float d = sqrtf(px * px + py * py + pz2);
+    // Calculate distance to the pixel (z = 0 without a DEM).
+    const float d = sqrtf(px * px + py * py + pz * pz);
     const float sx = p.delta_r * (d + p.d0);
 
     // Linear interpolation.
@@ -681,13 +713,17 @@ __device__ __forceinline__ void blocksvd_accumulate_pixel(
 // way, so those use FLAT=true and spread lanes over the whole tile
 // instead. The choice is CTA-uniform, so the __syncthreads() below are
 // reached by every thread of the CTA.
-template <int TR, int TJ, bool FLAT>
+//
+// With HasDem the pixel heights are staged next to the image tile (the
+// bilinear DEM lookup runs once per CTA per tile, not once per sweep).
+template <int TR, int TJ, bool FLAT, bool HasDem>
 __device__ void blocksvd_warp_sum(
           const complex64_t* __restrict__ img,
           const float2* __restrict__ data_row,
           float2 (*sh)[TR],
+          float (*shz)[TR],
           int ri0, int ri1, int ti0, int ti1,
-          float pos_x, float pos_y, float pz2,
+          float pos_x, float pos_y, float pos_z,
           bool active,
           const BlocksvdParams p,
           float* acc_r,
@@ -704,6 +740,9 @@ __device__ void blocksvd_warp_sum(
                 const int jj = t - ii * ncol;
                 sh[jj][ii] = *(const float2*)(
                         img + (size_t)(rb + ii) * p.Ntheta + tb + jj);
+                if constexpr (HasDem) {
+                    shz[jj][ii] = blocksvd_dem_z(p, rb + ii, tb + jj);
+                }
             }
             __syncthreads();
             if (!active) {
@@ -716,18 +755,21 @@ __device__ void blocksvd_warp_sum(
                     const int ii = t - jj * nrow;
                     const float theta = p.theta0 + (tb + jj) * p.dtheta;
                     const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
+                    const float z = HasDem ? shz[jj][ii] : 0.0f;
                     blocksvd_accumulate_pixel(
                             data_row, sh[jj][ii], p.r0 + (rb + ii) * p.dr,
-                            theta, ct, pos_x, pos_y, pz2, p, acc_r, acc_i);
+                            theta, ct, z, pos_x, pos_y, pos_z, p,
+                            acc_r, acc_i);
                 }
             } else {
                 for (int jj = 0; jj < ncol; jj++) {
                     const float theta = p.theta0 + (tb + jj) * p.dtheta;
                     const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
                     for (int ii = lane; ii < nrow; ii += 32) {
+                        const float z = HasDem ? shz[jj][ii] : 0.0f;
                         blocksvd_accumulate_pixel(
                                 data_row, sh[jj][ii], p.r0 + (rb + ii) * p.dr,
-                                theta, ct, pos_x, pos_y, pz2, p,
+                                theta, ct, z, pos_x, pos_y, pos_z, p,
                                 acc_r, acc_i);
                     }
                 }
@@ -744,10 +786,11 @@ constexpr unsigned int kBlocksvdThreads = 256;
 // Inner product of one image block against one sweep's backprojection
 // footprint: alpha[b, m] = sum over the block's pixels of
 // conj(img[pix]) * data[m, interp] * exp(j (ref_phase d - data_fmod sx)).
-// Per-pixel math matches gpga_backprojection_2d_kernel (z=0 pixel plane,
-// linear range interpolation); the master image acts as the pixel
-// weighting so the [npix, nsweeps] footprint matrix is never
-// materialized. Mirrors blocksvd_alpha_kernel_cpu in cpu/backproj.cpp.
+// Per-pixel math matches gpga_backprojection_2d_kernel (pixel on the z=0
+// plane, or on the DEM surface with HasDem, linear range interpolation);
+// the master image acts as the pixel weighting so the [npix, nsweeps]
+// footprint matrix is never materialized. Mirrors
+// blocksvd_alpha_kernel_cpu in cpu/backproj.cpp.
 //
 // Thread mapping: one warp per (block, sweep), lanes spread over the
 // block's pixels; alpha[b, m] is a warp-shuffle reduction. A thread per
@@ -758,7 +801,7 @@ constexpr unsigned int kBlocksvdThreads = 256;
 // gridDim.y indexes blocks, gridDim.x tiles the sweep axis relative to
 // each block's sweep_lo, so CTAs past a block's aperture window exit
 // before doing any work.
-template <int TR, int TJ>
+template <int TR, int TJ, bool HasDem>
 __global__ void blocksvd_alpha_kernel(
           const complex64_t* __restrict__ img,
           const float2* __restrict__ data,
@@ -768,6 +811,7 @@ __global__ void blocksvd_alpha_kernel(
           int nsweeps,
           const BlocksvdParams p) {
     __shared__ float2 sh[TJ][TR];
+    __shared__ float shz[HasDem ? TJ : 1][TR];
 
     const int idblock = blockIdx.y;
     const int lane = threadIdx.x & 31;
@@ -792,24 +836,25 @@ __global__ void blocksvd_alpha_kernel(
 
     float pos_x = 0.0f;
     float pos_y = 0.0f;
-    float pz2 = 0.0f;
+    float pos_z = 0.0f;
     const float2* data_row = data;
     if (active) {
         pos_x = pos[idsweep * 3 + 0];
         pos_y = pos[idsweep * 3 + 1];
-        const float pos_z = pos[idsweep * 3 + 2];
-        pz2 = pos_z * pos_z;
+        pos_z = pos[idsweep * 3 + 2];
         data_row = data + (size_t)idsweep * p.sweep_samples;
     }
 
     float acc_r = 0.0f;
     float acc_i = 0.0f;
     if (ri1 - ri0 < 32) {
-        blocksvd_warp_sum<TR, TJ, true>(img, data_row, sh, ri0, ri1, ti0, ti1,
-                pos_x, pos_y, pz2, active, p, &acc_r, &acc_i);
+        blocksvd_warp_sum<TR, TJ, true, HasDem>(img, data_row, sh, shz,
+                ri0, ri1, ti0, ti1, pos_x, pos_y, pos_z, active, p,
+                &acc_r, &acc_i);
     } else {
-        blocksvd_warp_sum<TR, TJ, false>(img, data_row, sh, ri0, ri1, ti0, ti1,
-                pos_x, pos_y, pz2, active, p, &acc_r, &acc_i);
+        blocksvd_warp_sum<TR, TJ, false, HasDem>(img, data_row, sh, shz,
+                ri0, ri1, ti0, ti1, pos_x, pos_y, pos_z, active, p,
+                &acc_r, &acc_i);
     }
 
     #pragma unroll
@@ -2938,7 +2983,8 @@ at::Tensor blocksvd_alpha_cuda(
           double theta0,
           double dtheta,
           double d0,
-          double data_fmod) {
+          double data_fmod,
+          const at::Tensor &dem) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
@@ -2947,6 +2993,23 @@ at::Tensor blocksvd_alpha_cuda(
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(blocks.device().type() == at::DeviceType::CUDA);
+
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / img.size(0);
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
 
 	at::Tensor img_contig = img.contiguous();
 	at::Tensor data_contig = data.contiguous();
@@ -2981,17 +3044,30 @@ at::Tensor blocksvd_alpha_cuda(
     const BlocksvdParams params = {
         (int)sweep_samples, (int)Ntheta, (float)(kPI * ref_phase), delta_r,
         (float)r0, (float)dr, (float)theta0, (float)dtheta,
-        (float)d0, (float)data_fmod};
+        (float)d0, (float)data_fmod,
+        dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta};
 
-    blocksvd_alpha_kernel<kBlocksvdTileR, kBlocksvdTileTheta>
-          <<<block_count, thread_per_block, 0, stream>>>(
-                  (const complex64_t*)img_ptr,
-                  (const float2*)data_ptr,
-                  pos_ptr,
-                  blocks_ptr,
-                  (complex64_t*)alpha_ptr,
-                  nsweeps,
-                  params);
+    if (has_dem) {
+        blocksvd_alpha_kernel<kBlocksvdTileR, kBlocksvdTileTheta, true>
+              <<<block_count, thread_per_block, 0, stream>>>(
+                      (const complex64_t*)img_ptr,
+                      (const float2*)data_ptr,
+                      pos_ptr,
+                      blocks_ptr,
+                      (complex64_t*)alpha_ptr,
+                      nsweeps,
+                      params);
+    } else {
+        blocksvd_alpha_kernel<kBlocksvdTileR, kBlocksvdTileTheta, false>
+              <<<block_count, thread_per_block, 0, stream>>>(
+                      (const complex64_t*)img_ptr,
+                      (const float2*)data_ptr,
+                      pos_ptr,
+                      blocks_ptr,
+                      (complex64_t*)alpha_ptr,
+                      nsweeps,
+                      params);
+    }
 	return alpha;
 }
 

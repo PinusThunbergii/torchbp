@@ -1044,14 +1044,38 @@ class TestBlocksvdAlpha(TestCase):
             "dtheta": 0.08,
             "d0": 0.2,
             "data_fmod": uniform(0, 2 * torch.pi),
+            "dem": None,
         }
-        return [args]
+        # Same geometry with the pixels on a terrain surface; the DEM
+        # has a different shape than the image to exercise the
+        # scaled bilinear index map (edge clamping included).
+        args_dem = dict(args)
+        args_dem["dem"] = 2.0 * torch.randn(7, 6, device=device)
+        return [args, args_dem]
+
+    @staticmethod
+    def _dem_z(dem, i_idx, j_idx, nr, ntheta):
+        """Kernel DEM convention: index * (dem_n / grid_n), bilinear,
+        edge clamped."""
+        dn0, dn1 = dem.shape
+        f0 = i_idx * (dn0 / nr)
+        f1 = j_idx * (dn1 / ntheta)
+        i0 = torch.clamp(torch.floor(f0).long(), 0, dn0 - 1)
+        j0 = torch.clamp(torch.floor(f1).long(), 0, dn1 - 1)
+        i1 = torch.clamp(i0 + 1, max=dn0 - 1)
+        j1 = torch.clamp(j0 + 1, max=dn1 - 1)
+        wi = f0 - i0
+        wj = f1 - j0
+        za = dem[i0, j0] + wj * (dem[i0, j1] - dem[i0, j0])
+        zb = dem[i1, j0] + wj * (dem[i1, j1] - dem[i1, j0])
+        return za + wi * (zb - za)
 
     def _reference(self, args):
         """Compose the same result from gpga_backprojection_2d_core + GEMV."""
         img, data, pos = args["img"], args["data"], args["pos"]
         blocks = args["blocks"]
         nsweeps = data.shape[0]
+        nr, ntheta = img.shape
         ref = torch.zeros(
             blocks.shape[0], nsweeps, dtype=torch.complex64, device=img.device
         )
@@ -1059,16 +1083,20 @@ class TestBlocksvdAlpha(TestCase):
             ri0, ri1, ti0, ti1, lo, hi = [int(v) for v in blocks[b]]
             if ri1 <= ri0 or ti1 <= ti0 or hi <= lo:
                 continue
-            r = args["r0"] + args["dr"] * torch.arange(
-                ri0, ri1, device=img.device, dtype=torch.float32
-            )
-            t = args["theta0"] + args["dtheta"] * torch.arange(
-                ti0, ti1, device=img.device, dtype=torch.float32
-            )
+            ri = torch.arange(ri0, ri1, device=img.device, dtype=torch.float32)
+            ti = torch.arange(ti0, ti1, device=img.device, dtype=torch.float32)
+            r = args["r0"] + args["dr"] * ri
+            t = args["theta0"] + args["dtheta"] * ti
             R, T = torch.meshgrid(r, t, indexing="ij")
             x = (R * torch.sqrt(torch.clamp(1.0 - T**2, min=0.0))).reshape(-1)
             y = (R * T).reshape(-1)
-            target_pos = torch.stack([x, y, torch.zeros_like(x)], dim=1)
+            if args["dem"] is not None:
+                I, J = torch.meshgrid(ri, ti, indexing="ij")
+                z = self._dem_z(args["dem"], I.reshape(-1), J.reshape(-1),
+                                nr, ntheta)
+            else:
+                z = torch.zeros_like(x)
+            target_pos = torch.stack([x, y, z], dim=1)
             B = torchbp.ops.gpga_backprojection_2d_core(
                 target_pos, data[lo:hi], pos[lo:hi], args["fc"],
                 args["r_res"], d0=args["d0"], data_fmod=args["data_fmod"],
@@ -1083,10 +1111,31 @@ class TestBlocksvdAlpha(TestCase):
                 args["img"], args["data"], args["pos"], args["blocks"],
                 args["fc"], args["r_res"], args["r0"], args["dr"],
                 args["theta0"], args["dtheta"], d0=args["d0"],
-                data_fmod=args["data_fmod"],
+                data_fmod=args["data_fmod"], dem=args["dem"],
             )
             ref = self._reference(args)
             torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+    def test_dem_changes_result(self):
+        # A DEM at a different height must move the footprint: guards
+        # against the dem argument being silently ignored.
+        args = self.sample_inputs("cpu")[1]
+        kw = dict(
+            fc=args["fc"], r_res=args["r_res"], r0=args["r0"],
+            dr=args["dr"], theta0=args["theta0"], dtheta=args["dtheta"],
+            d0=args["d0"], data_fmod=args["data_fmod"],
+        )
+        base = torchbp.ops.blocksvd_alpha(
+            args["img"], args["data"], args["pos"], args["blocks"], **kw)
+        out = torchbp.ops.blocksvd_alpha(
+            args["img"], args["data"], args["pos"], args["blocks"],
+            dem=args["dem"], **kw)
+        self.assertGreater((out - base).abs().max().item(), 1e-2)
+        # A flat zero DEM (any shape) is the z=0 plane.
+        flat = torchbp.ops.blocksvd_alpha(
+            args["img"], args["data"], args["pos"], args["blocks"],
+            dem=torch.zeros(5, 9), **kw)
+        torch.testing.assert_close(flat, base, rtol=1e-5, atol=1e-5)
 
     def _opcheck(self, device):
         for args in self.sample_inputs(device):
@@ -1099,7 +1148,7 @@ class TestBlocksvdAlpha(TestCase):
                  data.shape[0], blocks.shape[0], args["img"].shape[1],
                  args["fc"], args["r_res"], args["r0"], args["dr"],
                  args["theta0"], args["dtheta"], args["d0"],
-                 args["data_fmod"]),
+                 args["data_fmod"], args["dem"]),
                 test_utils=["test_schema"],
             )
 
@@ -1118,11 +1167,14 @@ class TestBlocksvdAlpha(TestCase):
                 dr=args["dr"], theta0=args["theta0"], dtheta=args["dtheta"],
                 d0=args["d0"], data_fmod=args["data_fmod"],
             )
+            dem = args["dem"]
             out_cpu = torchbp.ops.blocksvd_alpha(
-                args["img"], args["data"], args["pos"], args["blocks"], **kw)
+                args["img"], args["data"], args["pos"], args["blocks"],
+                dem=dem, **kw)
             out_gpu = torchbp.ops.blocksvd_alpha(
                 args["img"].cuda(), args["data"].cuda(), args["pos"].cuda(),
-                args["blocks"].cuda(), **kw).cpu()
+                args["blocks"].cuda(),
+                dem=None if dem is None else dem.cuda(), **kw).cpu()
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
 

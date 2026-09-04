@@ -932,6 +932,7 @@ def blocksvd_alpha(
     dtheta: float,
     d0: float = 0.0,
     data_fmod: float = 0.0,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """
     Per-block inner product of a master image against per-sweep slave
@@ -945,11 +946,12 @@ def blocksvd_alpha(
 
     where the sum runs over the block's pixel rectangle on the polar
     grid. Pixels are at ``r = r0 + dr * i``, ``theta = theta0 + dtheta * j``
-    on the z=0 plane, matching :func:`backprojection_polar_2d`. Linear
-    range interpolation; samples outside the data range window
-    contribute zero. Equivalent to ``conj(img_patch) @ B`` with ``B``
-    from :func:`gpga_backprojection_2d_core` over the block's pixels,
-    without materializing ``B``.
+    on the z=0 plane, or on the DEM surface when ``dem`` is given,
+    matching :func:`backprojection_polar_2d`. Linear range
+    interpolation; samples outside the data range window contribute
+    zero. Equivalent to ``conj(img_patch) @ B`` with ``B`` from
+    :func:`gpga_backprojection_2d_core` over the block's pixels, without
+    materializing ``B``.
 
     Parameters
     ----------
@@ -975,6 +977,13 @@ def blocksvd_alpha(
         Zero range correction.
     data_fmod : float
         Range modulation frequency applied to input data.
+    dem : Tensor or None
+        Optional float32 pixel-height map ``[dem_nr, dem_ntheta]``
+        covering the same r and theta extent as ``img`` (pixel index
+        maps to DEM index by the constant ratio ``dem_n / img_n`` per
+        axis, bilinear, edge clamped — the :func:`backprojection_polar_2d`
+        convention, so the same tensor the master was formed on can be
+        passed). Pixel ``z`` is taken from it instead of the z=0 plane.
 
     Returns
     -------
@@ -988,10 +997,17 @@ def blocksvd_alpha(
     assert img.dim() == 2
     assert pos.shape == (nsweeps, 3)
     assert blocks.shape == (nblocks, 6)
+    if dem is not None:
+        if dem.ndim != 2:
+            raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
+        if dem.dtype != torch.float32:
+            raise ValueError(f"dem must be float32, got {dem.dtype}")
+        if (dem.device.type, dem.device.index or 0) != (data.device.type, data.device.index or 0):
+            raise ValueError(f"dem must be on the same device as data ({data.device}), got {dem.device}")
     blocks = blocks.to(torch.int32).contiguous()
     return torch.ops.torchbp.blocksvd_alpha.default(
         img, data, pos, blocks, sweep_samples, nsweeps, nblocks, ntheta,
-        fc, r_res, r0, dr, theta0, dtheta, d0, data_fmod
+        fc, r_res, r0, dr, theta0, dtheta, d0, data_fmod, dem
     )
 
 
@@ -1723,6 +1739,7 @@ def _fake_blocksvd_alpha(
     dtheta: float,
     d0: float,
     data_fmod: float,
+    dem: Tensor,
 ):
     torch._check(img.dtype == torch.complex64)
     torch._check(data.dtype == torch.complex64)

@@ -3241,18 +3241,24 @@ at::Tensor gpga_backprojection_2d_cpu(
 // Inner product of one image block against one sweep's backprojection
 // footprint: alpha[b, m] = sum over the block's pixels of
 // conj(img[pix]) * data[m, interp] * exp(j (ref_phase d - data_fmod sx)).
-// Per-pixel math matches gpga_backprojection_2d_kernel_cpu (z=0 pixel
-// plane, linear range interpolation); the master image acts as the pixel
-// weighting so the [npix, nsweeps] footprint matrix is never materialized.
+// Per-pixel math matches gpga_backprojection_2d_kernel_cpu (pixel on the
+// z=0 plane, or on the DEM surface with HasDem, linear range
+// interpolation); the master image acts as the pixel weighting so the
+// [npix, nsweeps] footprint matrix is never materialized.
 // Mirrors blocksvd_alpha_kernel in cuda/backproj.cu; structured like
 // backprojection_polar_2d_row_cpu (SIMD geometry + phase pass into chunk
 // buffers, scalar copy pass, SIMD interpolate + accumulate pass).
+// The DEM shares the grid extent (pixel index * scale = DEM index,
+// bilinear, edge clamped), same convention as backprojection_polar_2d.
+template <bool HasDem>
 static void blocksvd_alpha_kernel_cpu(
           const complex64_t* img, const complex64_t* data, const float* pos,
           const int32_t* blocks, complex64_t* alpha, int sweep_samples,
           int nsweeps, int Ntheta, float ref_phase, float delta_r,
           float r0, float dr, float theta0, float dtheta, float d0,
-          float data_fmod, int idblock, int idsweep) {
+          float data_fmod, const float* dem, float dem_r_scale,
+          float dem_theta_scale, int dem_nr, int dem_ntheta,
+          int idblock, int idsweep) {
     constexpr int CHUNK = 256;
     float cs_buf[CHUNK], sn_buf[CHUNK], frac_buf[CHUNK];
     int idx_buf[CHUNK];
@@ -3286,6 +3292,16 @@ static void blocksvd_alpha_kernel_cpu(
         const float theta = theta0 + j * dtheta;
         const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
 
+        // DEM theta side is fixed for the whole column.
+        int dem_it0 = 0, dem_it1 = 0;
+        float dem_wt = 0.0f;
+        if constexpr (HasDem) {
+            const float ft = j * dem_theta_scale;
+            dem_it0 = std::min((int)ft, dem_ntheta - 1);
+            dem_it1 = std::min(dem_it0 + 1, dem_ntheta - 1);
+            dem_wt = ft - dem_it0;
+        }
+
         for (int rb = ri0; rb < ri1; rb += CHUNK) {
             const int nchunk = std::min(CHUNK, ri1 - rb);
 
@@ -3297,7 +3313,23 @@ static void blocksvd_alpha_kernel_cpu(
                 const float px = r * ct - pos_x;
                 const float py = r * theta - pos_y;
 
-                const float d = sqrtf(px * px + py * py + pz2);
+                float dz2 = pz2;
+                if constexpr (HasDem) {
+                    const float fr = (rb + q) * dem_r_scale;
+                    int ir0 = (int)fr;
+                    ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
+                    const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
+                    const float wr = fr - ir0;
+                    const float* dem_row0 = dem + (size_t)ir0 * dem_ntheta;
+                    const float* dem_row1 = dem + (size_t)ir1 * dem_ntheta;
+                    const float za = dem_row0[dem_it0]
+                        + dem_wt * (dem_row0[dem_it1] - dem_row0[dem_it0]);
+                    const float zb = dem_row1[dem_it0]
+                        + dem_wt * (dem_row1[dem_it1] - dem_row1[dem_it0]);
+                    const float pz = za + wr * (zb - za) - pos_z;
+                    dz2 = pz * pz;
+                }
+                const float d = sqrtf(px * px + py * py + dz2);
 
                 const float sx = delta_r * (d + d0);
                 const int id0 = (int)sx;
@@ -3367,7 +3399,8 @@ at::Tensor blocksvd_alpha_cpu(
           double theta0,
           double dtheta,
           double d0,
-          double data_fmod) {
+          double data_fmod,
+          const at::Tensor &dem) {
     TORCH_CHECK(img.dtype() == at::kComplexFloat);
     TORCH_CHECK(data.dtype() == at::kComplexFloat);
     TORCH_CHECK(pos.dtype() == at::kFloat);
@@ -3376,6 +3409,23 @@ at::Tensor blocksvd_alpha_cpu(
     TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
     TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
     TORCH_INTERNAL_ASSERT(blocks.device().type() == at::DeviceType::CPU);
+
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / img.size(0);
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
 
     at::Tensor img_contig = img.contiguous();
     at::Tensor data_contig = data.contiguous();
@@ -3402,13 +3452,16 @@ at::Tensor blocksvd_alpha_cpu(
 
     // Dynamic schedule: sweeps outside a block's aperture window return
     // immediately, so per-(block, sweep) work is very uneven.
+    auto kernel = has_dem ? &blocksvd_alpha_kernel_cpu<true>
+                          : &blocksvd_alpha_kernel_cpu<false>;
 #pragma omp parallel for collapse(2) schedule(dynamic, 8)
     for (int idblock = 0; idblock < nblocks; idblock++) {
         for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
-            blocksvd_alpha_kernel_cpu(
+            kernel(
                     img_ptr, data_ptr, pos_ptr, blocks_ptr, alpha_ptr,
                     sweep_samples, nsweeps, Ntheta, ref_phase, delta_r,
                     r0, dr, theta0, dtheta, d0, data_fmod / kPI,
+                    dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta,
                     idblock, idsweep);
         }
     }

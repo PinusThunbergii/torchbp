@@ -1211,6 +1211,37 @@ def _dem_at_pixels(
     return za + wi * (zb - za)
 
 
+def _dem_on_grid(
+    dem: Tensor,
+    grid: "PolarGrid | CartesianGrid | dict",
+    chunk_rows: int = 256,
+) -> Tensor:
+    """Resample a DEM sharing the grid extent to full grid resolution.
+
+    Returns the ``[n0, n1]`` float32 height of every image pixel under the
+    kernel index convention (see :func:`_dem_at_pixels`), so that row
+    slices of the result are exact 1:1 height maps of the corresponding
+    image rows. Done in row chunks to bound the index temporaries.
+    """
+    if _grid_is_polar(grid):
+        _, _, _, _, n0, n1, _, _ = unpack_polar_grid(grid)
+    else:
+        _, _, _, _, n0, n1, _, _ = unpack_cartesian_grid(grid)
+    dev = dem.device
+    if tuple(dem.shape) == (n0, n1):
+        return dem.to(torch.float32).contiguous()
+    out = torch.empty((n0, n1), dtype=torch.float32, device=dev)
+    j = torch.arange(n1, device=dev, dtype=torch.float32)
+    for i0 in range(0, n0, chunk_rows):
+        i1 = min(n0, i0 + chunk_rows)
+        i = torch.arange(i0, i1, device=dev, dtype=torch.float32)
+        I, J = torch.meshgrid(i, j, indexing="ij")
+        out[i0:i1] = _dem_at_pixels(
+            dem, grid, I.reshape(-1), J.reshape(-1)
+        ).reshape(i1 - i0, n1)
+    return out
+
+
 def _pixel_to_world(
     grid: "PolarGrid | CartesianGrid | dict",
     i_idx: Tensor,
@@ -2539,6 +2570,7 @@ def insar_rme_blocksvd(
     aperture_pad: float = 1.0,
     phi_lowpass: int = 0,
     spatial_coherence: Tensor | None = None,
+    dem: Tensor | None = None,
     return_alpha: bool = False,
     return_magnitude: bool = False,
     return_complex: bool = False,
@@ -2645,6 +2677,17 @@ def insar_rme_blocksvd(
         multiplied into the master image patch before forming each
         block's alpha, so contributions from vegetation or shadow areas are
         suppressed pixel-by-pixel.
+    dem : Tensor or None
+        Optional float32 pixel-height map ``[dem_nr, dem_ntheta]``
+        covering the same r and theta extent as ``grid_polar`` (the
+        :func:`torchbp.ops.backprojection_polar_2d` convention; pass the
+        same tensor the master image was formed on). The block alphas
+        then use the footprint of each pixel on the terrain surface
+        instead of the z=0 plane. Without it, scatterers off the plane
+        add a per-pixel phase ramp along the aperture that is odd in
+        aspect (terrain aliases into the along-track channel of
+        :func:`insar_rme_blocksvd_strata`) and a small even part that
+        biases X/Z on strong topography.
     phi_lowpass : int
         If > 0, lowpass-filter the recovered phase along the sweep axis
         with a Hamming window of this width (in samples). Use a value
@@ -2779,6 +2822,7 @@ def insar_rme_blocksvd(
     A_raw = blocksvd_alpha(
         img_m_eff.to(torch.complex64), data_s, pos_s, blocks,
         fc, r_res, r0, dr, theta0, dtheta, d0=d0, data_fmod=data_fmod,
+        dem=dem,
     )
     if aperture_mask:
         A_raw = A_raw * mask
@@ -2873,6 +2917,7 @@ def insar_rme_blocksvd_strata(
     ls_reg: float = 0.3,
     robust_iters: int = 2,
     spatial_coherence: Tensor | None = None,
+    dem: Tensor | None = None,
     return_phi_strata: bool = False,
     verbose: bool = False,
     altitude: float | None = None,
@@ -2977,6 +3022,15 @@ def insar_rme_blocksvd_strata(
         Strata whose weighted residuals exceed 1.345 times the global
         MAD scale are downweighted proportionally, rejecting
         decorrelated or layover-dominated strata. 0 disables.
+    dem : Tensor or None
+        Optional float32 pixel-height map ``[dem_nr, dem_ntheta]``
+        covering the grid extent (the
+        :func:`torchbp.ops.backprojection_polar_2d` convention, pass the
+        tensor the master was formed on). It is resampled to the grid
+        once and sliced per stratum for the block alphas, and the
+        strata look vectors and the Y lever use each stratum's
+        power-weighted mean height instead of z = 0. Requires
+        ``altitude=None``.
     return_phi_strata : bool
         If True, also return the [n_strata, nsweeps] per-strata phase
         matrix for diagnostics.
@@ -3007,6 +3061,15 @@ def insar_rme_blocksvd_strata(
     nsweeps_s = data_s.shape[0]
     n_axes = 1 + int(estimate_z)
     k_wave = 4.0 * torch.pi * fc / C0
+    z_map = None
+    if dem is not None:
+        if altitude is not None:
+            raise ValueError("dem is only supported with altitude=None "
+                             "(ground-range grid)")
+        # Full grid resolution once (kernel index convention), so the
+        # per-stratum row slices are exact 1:1 height maps.
+        z_map = _dem_on_grid(dem.to(device=device, dtype=torch.float32),
+                             grid_polar)
     if estimate_y:
         y_num = torch.zeros(nsweeps_s, dtype=torch.float32, device=device)
         y_den = torch.zeros(nsweeps_s, dtype=torch.float32, device=device)
@@ -3045,6 +3108,8 @@ def insar_rme_blocksvd_strata(
     # sin(el) is nearly constant.
     if strata_spacing == "elevation":
         h = float(pos_s[:, 2].mean().item())
+        if z_map is not None:
+            h = h - float(z_map.mean().item())
         h = max(abs(h), 1e-3)
         # Polar grid r is the ground-range coordinate of the target on
         # the z=0 plane. Slant range from a platform at altitude h is
@@ -3080,6 +3145,7 @@ def insar_rme_blocksvd_strata(
     mag_per_strata = torch.zeros_like(phi_per_strata)
     coh_per_strata = torch.ones(n_strata, dtype=torch.float32, device=device)
     strata_rc = torch.zeros(n_strata, dtype=torch.float32, device=device)
+    strata_zc = torch.zeros(n_strata, dtype=torch.float32, device=device)
     strata_valid = torch.zeros(n_strata, dtype=torch.bool, device=device)
 
     if verbose:
@@ -3105,16 +3171,24 @@ def insar_rme_blocksvd_strata(
             spatial_coherence[i0:i1, :]
             if spatial_coherence is not None else None
         )
+        z_s = z_map[i0:i1, :] if z_map is not None else None
+        if coh_s is not None or z_s is not None:
+            p_img = img_m[i0:i1, :].abs() ** 2
         if coh_s is not None:
             # Power-weighted coherence squared in this strata: bright
             # coherent scatterers dominate alpha, so weight the
             # coherence by image power instead of taking a plain mean,
             # which would underweight strata that are mostly dark
             # decorrelated pixels but contain strong coherent targets.
-            p_img = img_m[i0:i1, :].abs() ** 2
             coh_per_strata[s] = (
                 (p_img * coh_s ** 2).sum() / (p_img.sum() + 1e-30)
             )
+        if z_s is not None:
+            # Height of the stratum's effective phase centre: the same
+            # pixels that dominate alpha (power, coherence-weighted)
+            # define the look vector used in the X/Z split.
+            w_z = p_img * coh_s ** 2 if coh_s is not None else p_img
+            strata_zc[s] = (w_z * z_s).sum() / (w_z.sum() + 1e-30)
 
         _bs = insar_rme_blocksvd(
             data_s, pos_s, img_m[i0:i1, :], fc, r_res, gp_s,
@@ -3125,6 +3199,7 @@ def insar_rme_blocksvd_strata(
             aperture_mask=True, aperture_pad=1.0,
             phi_lowpass=0,
             spatial_coherence=coh_s,
+            dem=z_s,
             return_alpha=estimate_y,
             return_complex=True,
             verbose=False,
@@ -3139,7 +3214,8 @@ def insar_rme_blocksvd_strata(
             if altitude is not None:
                 lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2)
             else:
-                lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2 + h_y ** 2)
+                h_s = h_y - float(strata_zc[s].item())
+                lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2 + h_s ** 2)
             fwd = dy_b > 0
             bwd = dy_b < 0
             v_p = (A_s * fwd).sum(dim=0)
@@ -3180,10 +3256,12 @@ def insar_rme_blocksvd_strata(
         strata_valid[s] = True
 
         if verbose:
+            zc_txt = (f", z_c={strata_zc[s].item():.1f} m"
+                      if z_map is not None else "")
             print(f"  strata {s}: r=[{r0_s:.1f}, {r1_s:.1f}] m, "
                   f"Δr_rms={torch.sqrt(torch.mean(dr_per_strata[s] ** 2)).item() * 1000:.2f} mm, "
                   f"|v|={mag_per_strata[s].mean().item():.2e}, "
-                  f"coh²={coh_per_strata[s].item():.3f}")
+                  f"coh²={coh_per_strata[s].item():.3f}{zc_txt}")
 
     valid_idx = torch.where(strata_valid)[0]
     K = int(len(valid_idx))
@@ -3207,10 +3285,11 @@ def insar_rme_blocksvd_strata(
         dys = -pos_s[:, 1:2].expand(-1, K)
         dzs = torch.full_like(dxs, -H)
     else:
-        # Ground-range grid: rc is horizontal distance, pos_s z = altitude.
+        # Ground-range grid: rc is horizontal distance, pos_s z = altitude;
+        # the stratum sits at its mean terrain height (0 without a DEM).
         dxs = rc_active[None, :] - pos_s[:, 0:1]            # [nsweeps, K]
         dys = -pos_s[:, 1:2].expand(-1, K)
-        dzs = -pos_s[:, 2:3].expand(-1, K)
+        dzs = strata_zc[valid_idx][None, :] - pos_s[:, 2:3]
     rg = torch.sqrt(dxs ** 2 + dys ** 2)
     rs = torch.sqrt(rg ** 2 + dzs ** 2) + 1e-9
     cos_el = rg / rs
