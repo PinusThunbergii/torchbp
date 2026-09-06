@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import torch
 import numpy as np
 from torch import Tensor
@@ -2894,6 +2895,72 @@ def insar_rme_blocksvd(
     return out
 
 
+def _detrend_weighted(x: Tensor, t: Tensor, w: Tensor) -> Tensor:
+    """Remove the ``w``-weighted linear fit of ``x`` against ``t``."""
+    w = w.clamp(min=0)
+    sw = w.sum() + 1e-30
+    tm = (w * t).sum() / sw
+    xm = (w * x).sum() / sw
+    tc = t - tm
+    slope = (w * tc * (x - xm)).sum() / ((w * tc ** 2).sum() + 1e-30)
+    return x - xm - slope * tc
+
+
+def _blocksvd_odd_channel(
+    A_s: Tensor, lever: Tensor, k_wave: float, coh2: float
+) -> tuple[Tensor, Tensor]:
+    """Per-sweep along-track error from the odd-in-aspect part of one
+    stratum's aligned block alphas ``A_s`` [n_az, nsweeps], with the
+    per-(block, sweep) ``lever`` = sin(az) cos(el). Returns the estimate
+    (assumed - true, metres) and its fusion weight."""
+    fwd = lever > 0
+    bwd = lever < 0
+    v_p = (A_s * fwd).sum(dim=0)
+    v_m = (A_s * bwd).sum(dim=0)
+    wa = A_s.abs()
+    lev_p = (wa * fwd * lever).sum(0) / ((wa * fwd).sum(0) + 1e-30)
+    lev_m = (wa * bwd * lever).sum(0) / ((wa * bwd).sum(0) + 1e-30)
+    lev = lev_p - lev_m
+    # phase(v+) - phase(v-) = -k e_y (lev+ - lev-)
+    ey_s = -torch.angle(v_p * v_m.conj()) / (k_wave * lev.clamp(min=1e-3))
+    # Fisher-style weight: phase precision |v+||v-| coh^2 times the
+    # squared lever (far strata see the track at tiny aspect and would
+    # otherwise dominate through their |v| alone).
+    w_y = v_p.abs() * v_m.abs() * (lev > 0.05) * coh2 * lev ** 2
+    return ey_s, w_y
+
+
+def _blocksvd_strata_phase(
+    s: int, v_s: Tensor, rc: float, fc: float, phi_lowpass: int,
+    phi_per_strata: Tensor, dr_per_strata: Tensor, mag_per_strata: Tensor,
+    strata_rc: Tensor, strata_valid: Tensor,
+) -> None:
+    """Unwrap one stratum's coherent sum ``v_s`` into the per-strata
+    phase / slant-range tables of :func:`insar_rme_blocksvd_strata`.
+
+    Full-band phase with lowpass-referenced unwrap: the lowpassed phase
+    picks the 2*pi branch, the wrapped residual keeps the high-frequency
+    content that a plain lowpass would discard."""
+    phi_raw = -torch.angle(v_s)
+    phi_raw = phi_raw - phi_raw.mean()
+    if phi_lowpass and phi_lowpass > 1:
+        phi_ref = torch.angle(
+            conv_lowpass_filter(torch.exp(1j * phi_raw), phi_lowpass)
+        )
+        phi_ref = unwrap(phi_ref)
+        phi_s = phi_ref + torch.angle(
+            torch.exp(1j * (phi_raw - phi_ref))
+        )
+    else:
+        phi_s = unwrap(phi_raw)
+    phi_s = phi_s - phi_s.mean()
+    phi_per_strata[s] = phi_s
+    dr_per_strata[s] = phi_s * (C0 / (4.0 * torch.pi * fc))
+    mag_per_strata[s] = v_s.abs()
+    strata_rc[s] = rc
+    strata_valid[s] = True
+
+
 def insar_rme_blocksvd_strata(
     data_s: Tensor,
     pos_s: Tensor,
@@ -2914,6 +2981,8 @@ def insar_rme_blocksvd_strata(
     z_lowpass: int | None = None,
     y_lowpass: int | None = None,
     y_r_max: float | None = None,
+    y_repass: int = 0,
+    y_detrend: bool = False,
     ls_reg: float = 0.3,
     robust_iters: int = 2,
     spatial_coherence: Tensor | None = None,
@@ -3006,6 +3075,16 @@ def insar_rme_blocksvd_strata(
         Only strata with centre range <= ``y_r_max`` (m) contribute to the
         Y estimate. Far strata see the track at small aspect (tiny lever)
         and are the decorrelated part of the scene; None uses all.
+    y_repass : int
+        Number of joint refinement passes over the cached block alphas after the
+        first X/Z/Y estimate. Improves the estimate. Requires
+        ``estimate_y=True``.
+    y_detrend : bool
+        Remove the information-weighted linear trend from the Y estimate.
+        A linear along-track error is degenerate with a quadratic Z error in the
+        block-alpha system, so the odd channel's linear component is
+        unobservable noise. When it is fed back through ``y_repass`` it turns
+        into a Z bowl at the track ends. Default False.
     z_lowpass : int or None
         If > 1, additional Hamming-window lowpass applied to the Z
         correction only. Z is observed through the band-differential of
@@ -3076,6 +3155,8 @@ def insar_rme_blocksvd_strata(
         h_y = float(altitude) if altitude is not None else float(
             pos_s[:, 2].mean().abs().item()
         )
+        # (stratum index, aligned block alphas, lever) for y_repass.
+        y_cache = []
         tc_blocks = theta0 + (
             torch.arange(n_az_blocks_per_strata, device=device,
                          dtype=torch.float32) + 0.5
@@ -3205,55 +3286,47 @@ def insar_rme_blocksvd_strata(
             verbose=False,
         )
         v_s = _bs[-1]
-        if estimate_y and (y_r_max is None or rc <= y_r_max):
+        if estimate_y:
             # Odd-in-aspect (forward minus backward) half-aperture sums of
             # the aligned block alphas: X/Z and c_b cancel, Y adds.
             A_s = _bs[2]                                     # [n_az, nsweeps]
+            # Unit look vector y-component from each sweep to each block
+            # centre (rc cos(theta), rc theta, z_c): the exact lever,
+            # including the block's cross-track offset at wide aspect.
             yb = rc * tc_blocks                              # block along-track pos
             dy_b = yb[:, None] - pos_s[None, :, 1]           # [n_az, nsweeps]
             if altitude is not None:
-                lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2)
+                d_b = torch.sqrt(rc ** 2 + dy_b ** 2)
+                g_even = rc / d_b
+                x_g = float(np.sqrt(max(rc ** 2 - float(altitude) ** 2, 1e-6)))
+                lx_b = (x_g * torch.sqrt((1.0 - tc_blocks ** 2).clamp(min=0.0))[:, None]
+                        - pos_s[None, :, 0]) / d_b
+                lz_b = -float(altitude) / d_b
             else:
-                h_s = h_y - float(strata_zc[s].item())
-                lever = dy_b / torch.sqrt(rc ** 2 + dy_b ** 2 + h_s ** 2)
-            fwd = dy_b > 0
-            bwd = dy_b < 0
-            v_p = (A_s * fwd).sum(dim=0)
-            v_m = (A_s * bwd).sum(dim=0)
-            wa = A_s.abs()
-            lev_p = (wa * fwd * lever).sum(0) / ((wa * fwd).sum(0) + 1e-30)
-            lev_m = (wa * bwd * lever).sum(0) / ((wa * bwd).sum(0) + 1e-30)
-            lev = lev_p - lev_m
-            # phase(v+) - phase(v-) = -k e_y (lev+ - lev-); e_y = assumed - true
-            ey_s = -torch.angle(v_p * v_m.conj()) / (k_wave * lev.clamp(min=1e-3))
-            # Fisher-style weight: phase precision |v+||v-| coh^2 times the
-            # squared lever (far strata see the track at tiny aspect and
-            # would otherwise dominate through their |v| alone).
-            w_y = (v_p.abs() * v_m.abs() * (lev > 0.05) * float(coh_per_strata[s])
-                   * lev ** 2)
-            y_num += w_y * ey_s
-            y_den += w_y
-        # Full-band phase with lowpass-referenced unwrap: the lowpassed
-        # phase picks the 2*pi branch, the wrapped residual keeps the
-        # high-frequency content that a plain lowpass would discard.
-        phi_raw = -torch.angle(v_s)
-        phi_raw = phi_raw - phi_raw.mean()
-        if phi_lowpass and phi_lowpass > 1:
-            phi_ref = torch.angle(
-                conv_lowpass_filter(torch.exp(1j * phi_raw), phi_lowpass)
-            )
-            phi_ref = unwrap(phi_ref)
-            phi_s = phi_ref + torch.angle(
-                torch.exp(1j * (phi_raw - phi_ref))
-            )
-        else:
-            phi_s = unwrap(phi_raw)
-        phi_s = phi_s - phi_s.mean()
-        phi_per_strata[s] = phi_s
-        dr_per_strata[s] = phi_s * (C0 / (4.0 * torch.pi * fc))
-        mag_per_strata[s] = v_s.abs()
-        strata_rc[s] = rc
-        strata_valid[s] = True
+                xb = rc * torch.sqrt((1.0 - tc_blocks ** 2).clamp(min=0.0))
+                dx_b = xb[:, None] - pos_s[None, :, 0]
+                dz_b = float(strata_zc[s].item()) - pos_s[None, :, 2]
+                d_b = torch.sqrt(dx_b ** 2 + dy_b ** 2 + dz_b ** 2)
+                # Even basis: the X/Z phase of every block scales with
+                # 1/d (both look components do), normalised to the
+                # broadside centroid distance so its coefficient is the
+                # centroid slant-range error the X/Z solve expects.
+                d_c = torch.sqrt((rc - pos_s[:, 0]) ** 2
+                                 + (float(strata_zc[s].item()) - pos_s[:, 2]) ** 2)
+                g_even = d_c[None, :] / d_b
+                lx_b = dx_b / d_b
+                lz_b = dz_b / d_b
+            lever = dy_b / d_b
+            if y_r_max is None or rc <= y_r_max:
+                ey_s, w_y = _blocksvd_odd_channel(
+                    A_s, lever, k_wave, float(coh_per_strata[s]))
+                y_num += w_y * ey_s
+                y_den += w_y
+            if y_repass > 0:
+                y_cache.append((s, A_s, lever, g_even, lx_b, lz_b))
+        _blocksvd_strata_phase(
+            s, v_s, rc, fc, phi_lowpass, phi_per_strata, dr_per_strata,
+            mag_per_strata, strata_rc, strata_valid)
 
         if verbose:
             zc_txt = (f", z_c={strata_zc[s].item():.1f} m"
@@ -3302,61 +3375,147 @@ def insar_rme_blocksvd_strata(
         cols.append(sin_el)
     M = torch.stack(cols, dim=-1)                            # [nsweeps, K, n_axes]
 
-    y = dr_per_strata[valid_idx].t().unsqueeze(-1)           # [nsweeps, K, 1]
 
-    # Per-(strata, sweep) SNR weight from per-strata coherent magnitude.
-    # Strata at far range have poorer SNR and contribute less to the LS.
-    W = mag_per_strata[valid_idx].t()                        # [nsweeps, K]
-    # Multiply by per-strata power-weighted coherence (γ**2): downweights
-    # strata dominated by shadowed / decorrelated regions even when their
-    # coherent magnitude is non-trivial due to bright clutter.
-    coh_w = coh_per_strata[valid_idx]                        # [K]
-    W = W * coh_w[None, :]
-    if ls_reg > 0:
-        # Global normalization keeps absolute SNR information so the
-        # ridge shrinks genuinely low-SNR sweeps toward zero instead of
-        # amplifying noise through the ill-conditioned X/Z inverse.
-        W = W / (W.median() + 1e-30)
-    else:
-        # Per-sweep normalization keeps the LS scale consistent
-        W = W / (W.amax(dim=1, keepdim=True) + 1e-30)
-    sqrtW = W.sqrt().unsqueeze(-1)                           # [nsweeps, K, 1]
+    def _solve_xz() -> Tensor:
+        """Per-sweep ridge / Huber LS of the current per-strata slant-range
+        tables onto the X(/Z) look columns. Called once, and again after
+        each y_repass with the Y-corrected tables (fresh solve each time,
+        so the ridge is not iterated away)."""
+        y = dr_per_strata[valid_idx].t().unsqueeze(-1)       # [nsweeps, K, 1]
 
-    if ls_reg > 0:
-        reg_rows = ls_reg * torch.eye(n_axes, device=device).unsqueeze(
-            0
-        ).expand(nsweeps_s, -1, -1)
-        reg_rhs = torch.zeros((nsweeps_s, n_axes, 1), device=device)
-
-    sqrtW_cur = sqrtW
-    for it in range(max(0, int(robust_iters)) + 1):
-        Mw = M * sqrtW_cur
-        yw = y * sqrtW_cur
+        # Per-(strata, sweep) SNR weight from per-strata coherent magnitude.
+        # Strata at far range have poorer SNR and contribute less to the LS.
+        W = mag_per_strata[valid_idx].t()                    # [nsweeps, K]
+        # Multiply by per-strata power-weighted coherence (γ**2): downweights
+        # strata dominated by shadowed / decorrelated regions even when their
+        # coherent magnitude is non-trivial due to bright clutter.
+        coh_w = coh_per_strata[valid_idx]                    # [K]
+        W = W * coh_w[None, :]
         if ls_reg > 0:
-            Mw = torch.cat([Mw, reg_rows], dim=1)
-            yw = torch.cat([yw, reg_rhs], dim=1)
-        sol = torch.linalg.lstsq(Mw, yw).solution            # [nsweeps, n_axes, 1]
-        if it >= robust_iters:
-            break
-        # Huber IRLS on the weighted residuals: strata inconsistent
-        # with the per-sweep solution (decorrelated regions, layover)
-        # get their weight reduced proportionally to the excess over
-        # 1.345x the global MAD scale.
-        u = ((y - M @ sol) * sqrtW).squeeze(-1).abs()        # [nsweeps, K]
-        scale = 1.4826 * u.median() + 1e-30
-        w_h = torch.clamp(1.345 * scale / (u + 1e-30), max=1.0)
-        sqrtW_cur = sqrtW * w_h.sqrt().unsqueeze(-1)
-    sol = sol.squeeze(-1)                                    # [nsweeps, n_axes]
+            # Global normalization keeps absolute SNR information so the
+            # ridge shrinks genuinely low-SNR sweeps toward zero instead of
+            # amplifying noise through the ill-conditioned X/Z inverse.
+            W = W / (W.median() + 1e-30)
+        else:
+            # Per-sweep normalization keeps the LS scale consistent
+            W = W / (W.amax(dim=1, keepdim=True) + 1e-30)
+        sqrtW = W.sqrt().unsqueeze(-1)                       # [nsweeps, K, 1]
+
+        if ls_reg > 0:
+            reg_rows = ls_reg * torch.eye(n_axes, device=device).unsqueeze(
+                0
+            ).expand(nsweeps_s, -1, -1)
+            reg_rhs = torch.zeros((nsweeps_s, n_axes, 1), device=device)
+
+        sqrtW_cur = sqrtW
+        for it in range(max(0, int(robust_iters)) + 1):
+            Mw = M * sqrtW_cur
+            yw = y * sqrtW_cur
+            if ls_reg > 0:
+                Mw = torch.cat([Mw, reg_rows], dim=1)
+                yw = torch.cat([yw, reg_rhs], dim=1)
+            sol = torch.linalg.lstsq(Mw, yw).solution        # [nsweeps, n_axes, 1]
+            if it >= robust_iters:
+                break
+            # Huber IRLS on the weighted residuals: strata inconsistent
+            # with the per-sweep solution (decorrelated regions, layover)
+            # get their weight reduced proportionally to the excess over
+            # 1.345x the global MAD scale.
+            u = ((y - M @ sol) * sqrtW).squeeze(-1).abs()    # [nsweeps, K]
+            scale = 1.4826 * u.median() + 1e-30
+            w_h = torch.clamp(1.345 * scale / (u + 1e-30), max=1.0)
+            sqrtW_cur = sqrtW * w_h.sqrt().unsqueeze(-1)
+        return sol.squeeze(-1)                               # [nsweeps, n_axes]
+
+    sol = _solve_xz()
+
+    if estimate_y:
+        ey = y_num / (y_den + 1e-30)
+        y_lp = delta_lowpass if y_lowpass is None else y_lowpass
+        if y_lp and y_lp > 1:
+            ey = conv_lowpass_filter(ey, y_lp)
+        if y_detrend:
+            ey = _detrend_weighted(ey, pos_s[:, 1], y_den)
+        # Y not yet removed from the cached alphas: the full estimate on
+        # the first pass, then only each pass's residual.
+        ey_apply = ey
+        for it in range(max(0, int(y_repass))):
+            # Remove the fitted Y phase from every cached block alpha and
+            # re-align the block constants against the corrected alphas
+            # (the one-shot alignment absorbed the window correlation of
+            # the Y phase with the lever). The even (X/Z) channel is then
+            # re-derived from the corrected coherent sums and solved
+            # afresh. The residual Y comes from a per-sweep weighted
+            # regression of the residual block phases on [g_even, lever]
+            # after the fitted X/Z phase has been removed as well: the
+            # even phase is not constant across blocks (it scales with
+            # 1/d and with the block's cos(theta)), and under one-sided
+            # coverage (track ends) its curvature aliases into the lever
+            # slope unless it is taken out first.
+            X_cur = sol[:, 0]
+            Z_cur = sol[:, 1] if estimate_z else torch.zeros_like(X_cur)
+            y_num.zero_()
+            y_den.zero_()
+            for ci, (s, A_s, lever, g_even, lx_b, lz_b) in enumerate(y_cache):
+                A_s = A_s * torch.exp(1j * (k_wave * ey_apply[None, :] * lever))
+                # Fitted X/Z phase (alpha phase model: +k (lx X + ly Y +
+                # lz Z) per block); the block constants are re-estimated
+                # on the model-free residual so that they no longer carry
+                # the window mean of the X/Z phase, which under one-sided
+                # coverage reads as a spurious lever slope (linear false Y
+                # from a real X error).
+                xz_phase = torch.exp(-1j * (k_wave * (
+                    lx_b * X_cur[None, :] + lz_b * Z_cur[None, :])))
+                u = (A_s * xz_phase).sum(dim=1, keepdim=True)
+                A_s = A_s * (u.conj() / (u.abs() + 1e-30))
+                y_cache[ci] = (s, A_s, lever, g_even, lx_b, lz_b)
+                rc = float(strata_rc[s].item())
+                v = A_s.sum(dim=0)                               # [nsweeps]
+                if y_r_max is None or rc <= y_r_max:
+                    R = A_s * xz_phase
+                    R = R * torch.exp(-1j * torch.angle(R.sum(dim=0)))[None, :]
+                    r = torch.angle(R)
+                    w = R.abs()
+                    Sgg = (w * g_even ** 2).sum(0)
+                    Sgl = (w * g_even * lever).sum(0)
+                    Sll = (w * lever ** 2).sum(0)
+                    Tg = (w * g_even * r).sum(0)
+                    Tl = (w * lever * r).sum(0)
+                    det = Sgg * Sll - Sgl ** 2
+                    S0 = w.sum(0)
+                    var_l = det / (Sgg * S0 + 1e-30)             # lever spread about g
+                    ok = (var_l > 0.05 ** 2) & (S0 > 0)
+                    slope = torch.where(
+                        ok, (Sgg * Tl - Sgl * Tg) / (det + 1e-30),
+                        torch.zeros_like(det))
+                    dey_s = -slope / k_wave
+                    # slope information (|A|^2-scale like the first-pass
+                    # weight) times the stratum coherence.
+                    w_y = ok * det * float(coh_per_strata[s])
+                    y_num += w_y * dey_s
+                    y_den += w_y
+                _blocksvd_strata_phase(
+                    s, v.conj(), rc, fc, phi_lowpass,
+                    phi_per_strata, dr_per_strata, mag_per_strata,
+                    strata_rc, strata_valid)
+            ey_res = y_num / (y_den + 1e-30)
+            if y_lp and y_lp > 1:
+                ey_res = conv_lowpass_filter(ey_res, y_lp)
+            if y_detrend:
+                ey_res = _detrend_weighted(ey_res, pos_s[:, 1], y_den)
+            if verbose:
+                print(f"  Y repass {it + 1}: residual Y rms "
+                      f"{torch.sqrt(torch.mean(ey_res ** 2)).item() * 1000:.2f} mm")
+            ey = ey + ey_res
+            ey_apply = ey_res
+            sol = _solve_xz()
+        y_cache = []
 
     delta = torch.zeros((nsweeps_s, 3), dtype=torch.float32, device=device)
     delta[:, 0] = sol[:, 0]
     if estimate_z:
         delta[:, 2] = sol[:, 1]
     if estimate_y:
-        ey = y_num / (y_den + 1e-30)
-        y_lp = delta_lowpass if y_lowpass is None else y_lowpass
-        if y_lp and y_lp > 1:
-            ey = conv_lowpass_filter(ey, y_lp)
         # ey is (assumed - true); the correction added to pos_s is -ey.
         delta[:, 1] = -ey
     delta = delta - delta.mean(dim=0, keepdim=True)
