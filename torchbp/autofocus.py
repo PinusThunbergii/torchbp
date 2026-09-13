@@ -2054,6 +2054,9 @@ def gpga_tde(
     data_fmod: float = 0,
     dem: Tensor | None = None,
     weight_cache_bytes: int = WEIGHT_CACHE_BYTES,
+    coarse_window: int | None = None,
+    coarse_margin: float = 2.0,
+    coarse_estimate_z: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus [1]_ with time-domain error (TDE) 3D
@@ -2231,7 +2234,25 @@ def gpga_tde(
         several GB. Blocks that do not fit recompute their rows each
         iteration, which costs a few milliseconds per block. Only used when
         the antenna pattern is given.
-
+    coarse_window : int or None
+        Enables a two-stage schedule. Wide lowpass windows pass range-ring
+        clutter whose Doppler centroid biases the phase gradient by a term
+        proportional to sin(aspect). On a clutter-dominated wide-beam scene the
+        default initial window turns this into parabolic track error in z. While
+        ``window_width > coarse_window`` that mode is regressed out of each
+        block's phase gradient and the next window is set from the solved step
+        (see ``coarse_margin``), at or below it the estimator runs unmodified.
+        None (default) keeps the single-stage schedule.
+    coarse_margin : float
+        Safety factor on the window chosen after a coarse iteration:
+        ``coarse_margin * 16 * A / wavelength`` sweeps for a largest solved
+        step ``A``, clamped between ``coarse_window`` and the regular
+        ``window_exp`` schedule.
+    coarse_estimate_z : bool
+        Update z in the coarse iterations as well (default True). z is the
+        weakly observed direction of the per-sweep solve. False solves x and
+        y only until the fine iterations. Ignored when ``estimate_z`` is
+        False.
 
     References
     ----------
@@ -2258,6 +2279,8 @@ def gpga_tde(
 
     if block_weighting not in ("sum", "harmonic", "floor"):
         raise ValueError(f"Unknown block_weighting {block_weighting}")
+    if coarse_window is not None and coarse_window < 1:
+        raise ValueError("coarse_window must be positive or None")
     # Per-target variance floor for block_weighting="floor". 0 until the
     # first iteration's raw weights set the scale.
     weight_floor = 0.0
@@ -2326,6 +2349,8 @@ def gpga_tde(
         lp_w = fft_lowpass_filter_precalculate_window(
             pos_new.shape[0], window_width, img.device, lowpass_window, fast_len=True
         )
+        coarse_iter = coarse_window is not None and window_width > coarse_window
+        est_z = estimate_z and (coarse_estimate_z or not coarse_iter)
         for ir in range(range_divisions):
             for jr in range(azimuth_divisions):
                 ir1 = (ir + 1) * rdiv if ir < range_divisions - 1 else None
@@ -2415,6 +2440,8 @@ def gpga_tde(
                     local_w[ir * azimuth_divisions + jr, :] = block_w * beam_w
                 else:
                     local_w[ir * azimuth_divisions + jr, :] = block_w
+                if coarse_iter:
+                    phi = _project_aspect_mode(phi, target_pos, pos_new, beam_w)
                 phi = unwrap(phi)
                 phi = weighted_detrend(phi, beam_w)
                 # Phase to distance
@@ -2481,7 +2508,7 @@ def gpga_tde(
         cos_az = torch.cos(target_az)
         cos_el = torch.cos(target_el)
         sin_el = torch.sin(target_el)
-        if estimate_z:
+        if est_z:
             m = torch.stack([cos_az * cos_el, sin_az * cos_el, sin_el], dim=-1)
         else:
             m = torch.stack([cos_az * cos_el, sin_az * cos_el], dim=-1)
@@ -2534,23 +2561,65 @@ def gpga_tde(
             ).item()
         )
         if verbose:
-            print(f"{i+1}, {window_width}, {rms_error}")
+            stage = " (coarse)" if coarse_iter else ""
+            print(f"{i+1}, {window_width}, {rms_error}{stage}")
         if rms_error < rms_error_limit:
             if verbose:
                 print("RMS error limit reached")
             break
         pos_new[:, 0] = pos_new[:, 0] + d_solved[0]
         pos_new[:, 1] = pos_new[:, 1] + d_solved[1]
-        if estimate_z:
+        if est_z:
             pos_new[:, 2] = pos_new[:, 2] + d_solved[2]
 
         img = form_image(pos_new)
-        window_width = int(window_width * window_exp)
+        next_window = int(window_width * window_exp)
+        if coarse_iter:
+            # The residual after this step is at most about the step just
+            # solved. A residual of amplitude A needs a passband of
+            # 16*A/wavelength sweeps (its phase chirps at 8*pi*A/wavelength
+            # over half the aperture), so jump the window to what is still
+            # needed instead of walking it down through windows whose only
+            # effect would be more clutter bias.
+            a_max = torch.max(torch.abs(d_solved)).item()
+            needed = int(coarse_margin * 16 * a_max / wl)
+            next_window = max(coarse_window, min(next_window, needed))
+        window_width = next_window
         if window_width < min_window:
             if verbose:
                 print("Window width below the minimum size")
             break
     return img, pos_new
+
+
+def _project_aspect_mode(
+    phi: Tensor, target_pos: Tensor, pos: Tensor, beam_w: Tensor | None
+) -> Tensor:
+    """Remove the sin(aspect) mode from a block's integrated phase.
+
+    The clutter Doppler-centroid bias of the adjacent-sweep phase products
+    is proportional to the sine of the block's aspect angle at each sweep
+    (see :func:`gpga_tde` ``coarse_window``). The phase gradient is
+    regressed on ``[1, sin(aspect)]`` over the sweeps, weighted by the
+    block illumination, the sin(aspect) component is subtracted and the
+    gradient re-integrated. The constant is kept: it is the linear phase
+    the detrend removes anyway.
+    """
+    c = target_pos.mean(dim=0)
+    dx = c[0] - pos[:, 0]
+    dy = c[1] - pos[:, 1]
+    sa = (dy / torch.clamp(torch.hypot(dx, dy), min=1e-12))[1:]
+    pd = torch.diff(phi)
+    if beam_w is None:
+        w = torch.ones_like(pd)
+    else:
+        w = torch.sqrt(torch.clamp(beam_w[1:], min=0))
+    X = torch.stack([torch.ones_like(sa), sa], dim=1)
+    coef = torch.linalg.lstsq(
+        w[:, None] * X, (w * pd)[:, None]
+    ).solution.squeeze(-1)
+    pd = pd - coef[1] * sa
+    return torch.cumsum(torch.nn.functional.pad(pd, (1, 0)), dim=0)
 
 
 def insar_rme_blocksvd(

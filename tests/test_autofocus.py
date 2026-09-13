@@ -667,6 +667,51 @@ class TestGpgaBpPolarTde(TestGpgaBpPolar):
         resid = detrend(dx - d).pow(2).mean().sqrt().item()
         self.assertLess(resid, 0.5 * dx.pow(2).mean().sqrt().item())
 
+    def _tde_scene_with_x_error(self):
+        targets, amps, pos = self._scene()
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+        return data, pos, dx, img_blur
+
+    def test_coarse_window_schedule_recovers_position(self):
+        # Two-stage schedule: coarse iterations with the sin(aspect) mode
+        # projected out of the block phase gradient and an error-driven
+        # window jump, then regular iterations. Must still focus the scene
+        # and track the injected error; the coarse stage must actually run
+        # (initial window above coarse_window) and the run must converge
+        # in fewer iterations than the plain schedule needs to walk the
+        # window down.
+        from torchbp.util import detrend
+        data, pos, dx, img_blur = self._tde_scene_with_x_error()
+        img_focus, pos_new = torchbp.autofocus.gpga_tde(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            azimuth_divisions=2, range_divisions=2, estimate_z=False,
+            max_iters=8, target_threshold_db=15,
+            coarse_window=self.nsweeps // 8,
+        )
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(pos_new).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+        d = pos_new[:, 0] - pos[:, 0]
+        resid = detrend(dx - d).pow(2).mean().sqrt().item()
+        self.assertLess(resid, 0.5 * dx.pow(2).mean().sqrt().item())
+        with self.assertRaises(ValueError):
+            torchbp.autofocus.gpga_tde(
+                None, data, pos, self.fc, self.r_res, self.grid_polar,
+                azimuth_divisions=2, range_divisions=2, estimate_z=False,
+                max_iters=1, coarse_window=0,
+            )
+
     def test_dead_blocks_and_ffbp_initial_image(self):
         # Regression: blocks with no targets (grid extends past the data's
         # max range) used to crash on an empty reduction, and the initial
